@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/model"
@@ -28,22 +27,27 @@ func RequestActivityID(r model.Request, nexusRequestID string) string {
 	return "request-activity/" + r.RunID + "/" + hex.EncodeToString(h[:])
 }
 
-func RegisterService(w worker.Worker, c client.Client, p provider.Provider) {
-	w.RegisterWorkflow(CoordinatorWorkflow)
+func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo Repository) {
 	w.RegisterWorkflow(BatchWorkflow)
-	w.RegisterActivity(&ServiceActivities{Client: c, Provider: p})
+	activities := &ServiceActivities{Client: c, Provider: p, Store: repo}
+	// Enrollment and exact-token completion are plain helpers inside these
+	// Activities. They are not registered as per-request Workflow Activities.
+	for _, implementation := range []any{activities.SubmitRequest, activities.Upload, activities.Create, activities.Find,
+		activities.Retrieve, activities.Results, activities.FailBatch, activities.SaveReport, activities.Deliver} {
+		w.RegisterActivity(implementation)
+	}
 	op := temporalnexus.MustNewTemporalOperation(temporalnexus.TemporalOperationOptions[model.Request, model.Result]{
 		Name: model.Operation,
 		Start: func(ctx context.Context, nc temporalnexus.NexusClient, input model.Request, opts temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[model.Result], error) {
 			if err := model.ValidateRequest(input); err != nil {
 				return temporalnexus.TemporalOperationResult[model.Result]{}, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "%s", err)
 			}
-			value, err := nc.GetWorkflowClient().QueryWorkflow(ctx, model.CoordinatorID(input.RunID), "", model.ConfigQuery)
+			run, err := repo.GetRun(ctx, input.RunID)
 			if err != nil {
-				return temporalnexus.TemporalOperationResult[model.Result]{}, configurationQueryError(err)
+				return temporalnexus.TemporalOperationResult[model.Result]{}, configurationLookupError(err)
 			}
-			var config model.Config
-			if err := value.Get(&config); err != nil {
+			config := run.Config
+			if err := validateIngressEndpoint(config.Endpoint, temporalnexus.GetOperationInfo(ctx).Endpoint); err != nil {
 				return temporalnexus.TemporalOperationResult[model.Result]{}, err
 			}
 			if err := config.Validate(); err != nil {
@@ -76,12 +80,24 @@ func RegisterService(w worker.Worker, c client.Client, p provider.Provider) {
 	w.RegisterNexusService(svc)
 }
 
-func configurationQueryError(err error) *nexus.HandlerError {
+func validateIngressEndpoint(configured, actual string) error {
+	// Endpoint is populated by servers >=1.30. Older servers leave it empty.
+	if actual != "" && actual != configured {
+		return nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "batching run belongs to another Nexus endpoint")
+	}
+	return nil
+}
+
+func configurationLookupError(err error) *nexus.HandlerError {
+	var invalid *model.Failure
+	if errors.As(err, &invalid) {
+		return nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "%s", invalid.Message)
+	}
 	var missing *serviceerror.NotFound
 	if errors.As(err, &missing) {
 		return nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "batching run is not open")
 	}
-	// A transport or query-task failure occurs before an Activity is created.
+	// A storage failure occurs before an Activity is created.
 	// Permit Nexus to retry the start without exposing raw query diagnostics.
 	return &nexus.HandlerError{Type: nexus.HandlerErrorTypeUnavailable,
 		Message:       "batching run configuration is temporarily unavailable",
@@ -131,23 +147,12 @@ var serviceActivities *ServiceActivities
 type ServiceActivities struct {
 	Client   client.Client
 	Provider provider.Provider
+	Store    Repository
 }
 
 func (a *ServiceActivities) Enroll(ctx context.Context, e model.Enrollment) (model.Admission, error) {
-	h, err := a.Client.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
-		WorkflowID: model.CoordinatorID(e.Request.RunID), UpdateName: model.EnrollUpdate,
-		UpdateID: enrollmentUpdateID(e), Args: []any{e}, WaitForStage: client.WorkflowUpdateStageCompleted,
-	})
-	if err != nil {
-		var missing *serviceerror.NotFound
-		if errors.As(err, &missing) {
-			return model.Admission{}, failure("RUN_NOT_STARTED", "batching run is not open")
-		}
-		return model.Admission{}, err
-	}
-	var admission model.Admission
-	err = h.Get(ctx, &admission)
-	return admission, err
+	admission, err := a.Store.Enroll(ctx, e)
+	return admission, typedFailure(err)
 }
 
 func providerError(err error) error {
@@ -157,12 +162,16 @@ func providerError(err error) error {
 	return err
 }
 
-func (a *ServiceActivities) Upload(ctx context.Context, m model.Manifest) (string, error) {
-	b, err := model.JSONL(m)
+func (a *ServiceActivities) Upload(ctx context.Context, ref model.BatchRef) (string, error) {
+	m, err := a.Store.LoadManifest(ctx, ref.BatchID)
+	if err != nil {
+		return "", err
+	}
+	data, err := model.JSONL(m)
 	if err != nil {
 		return "", failure("INVALID_BATCH", err.Error())
 	}
-	id, err := a.Provider.Upload(ctx, m.BatchID, b)
+	id, err := a.Provider.Upload(ctx, ref.BatchID, data)
 	return id, providerError(err)
 }
 
@@ -174,39 +183,72 @@ type CreateResult struct {
 
 // Create's Activity has one attempt and the provider makes one HTTP attempt.
 // An Activity transport failure is also ambiguous and is reconciled by Find.
-func (a *ServiceActivities) Create(ctx context.Context, fileID string, metadata map[string]string) (CreateResult, error) {
-	job, err := a.Provider.Create(ctx, fileID, metadata)
+func (a *ServiceActivities) Create(ctx context.Context, ref model.BatchRef, fileID string) (CreateResult, error) {
+	job, err := a.Provider.Create(ctx, fileID, batchMetadata(ref))
 	if err != nil {
 		return CreateResult{Failure: err.Error(), Ambiguous: provider.IsAmbiguous(err)}, nil
 	}
-	return CreateResult{Job: job}, nil
+	return CreateResult{Job: controlJob(job)}, nil
 }
 
-func (a *ServiceActivities) Find(ctx context.Context, metadata map[string]string) ([]provider.Job, error) {
-	jobs, err := a.Provider.Find(ctx, metadata)
-	return jobs, providerError(err)
+func (a *ServiceActivities) Find(ctx context.Context, ref model.BatchRef, fileID string) (CreateResult, error) {
+	jobs, err := a.Provider.Find(ctx, batchMetadata(ref))
+	if err != nil {
+		return CreateResult{}, providerError(err)
+	}
+	var match provider.Job
+	count := 0
+	for _, candidate := range jobs {
+		if candidate.InputFileID == fileID && metadataEqual(candidate.Metadata, batchMetadata(ref)) {
+			match = candidate
+			count++
+		}
+	}
+	if count != 1 {
+		return CreateResult{Ambiguous: true, Failure: "provider submission could not be uniquely reconciled"}, nil
+	}
+	return CreateResult{Job: controlJob(match)}, nil
 }
 func (a *ServiceActivities) Retrieve(ctx context.Context, id string) (provider.Job, error) {
 	job, err := a.Provider.Retrieve(ctx, id)
-	return job, providerError(err)
+	return controlJob(job), providerError(err)
 }
 
-type ReconciledResults struct {
-	Outcomes    []model.Outcome
-	Diagnostics []string
+func controlJob(job provider.Job) provider.Job {
+	// Arbitrary upstream metadata stays outside Workflow histories.
+	job.Metadata = nil
+	return job
 }
 
-func (a *ServiceActivities) Results(ctx context.Context, m model.Manifest, job provider.Job) (ReconciledResults, error) {
+// Results keeps raw output, outcomes and task tokens inside this Activity and
+// Postgres. The Workflow receives only a bounded aggregate.
+func (a *ServiceActivities) Results(ctx context.Context, ref model.BatchRef, job provider.Job) (model.DeliverySummary, error) {
+	manifest, err := a.Store.LoadManifest(ctx, ref.BatchID)
+	if err != nil {
+		return model.DeliverySummary{}, err
+	}
 	output, errorFile, err := a.Provider.Results(ctx, job)
 	if err != nil {
-		return ReconciledResults{}, providerError(err)
+		return model.DeliverySummary{}, providerError(err)
 	}
-	outcomes, diagnostics := provider.Reconcile(m, job, output, errorFile)
-	return ReconciledResults{Outcomes: outcomes, Diagnostics: diagnostics}, nil
+	outcomes, diagnostics := provider.Reconcile(manifest, job, output, errorFile)
+	if err := a.Store.SaveOutcomes(ctx, ref.BatchID, outcomes, diagnostics); err != nil {
+		return model.DeliverySummary{}, err
+	}
+	return a.Store.DeliverySummary(ctx, ref.BatchID)
 }
 
-func batchMetadata(m model.Manifest) map[string]string {
-	return map[string]string{"run_id": m.RunID, "logical_batch_id": m.BatchID}
+func (a *ServiceActivities) FailBatch(ctx context.Context, ref model.BatchRef, code, message string) (model.DeliverySummary, error) {
+	if err := a.Store.FailBatch(ctx, ref.BatchID, code, message); err != nil {
+		return model.DeliverySummary{}, err
+	}
+	return a.Store.DeliverySummary(ctx, ref.BatchID)
 }
 
-func batchName(runID string, sequence int) string { return fmt.Sprintf("%s-%04d", runID, sequence) }
+func (a *ServiceActivities) SaveReport(ctx context.Context, report model.BatchReport) error {
+	return a.Store.SaveReport(ctx, report)
+}
+
+func batchMetadata(ref model.BatchRef) map[string]string {
+	return map[string]string{"run_id": ref.RunID, "logical_batch_id": ref.BatchID}
+}

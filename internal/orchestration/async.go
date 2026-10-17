@@ -2,10 +2,7 @@ package orchestration
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"reflect"
 	"time"
 
@@ -38,7 +35,7 @@ func (a *ServiceActivities) SubmitRequest(ctx context.Context, input model.SAAIn
 	}}
 	// The SAA itself has a single attempt because legacy async completion cannot
 	// separate submission retries from a later externally reported failure.
-	// These short retries reuse one Update ID and the same fenced target.
+	// These short retries reuse the same database identity and fenced target.
 	enrollCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	var err error
@@ -71,11 +68,6 @@ func retryEnrollment(err error) bool {
 	var permission *serviceerror.PermissionDenied
 	var invalid *serviceerror.InvalidArgument
 	return !errors.As(err, &permission) && !errors.As(err, &invalid)
-}
-
-func enrollmentUpdateID(e model.Enrollment) string {
-	hash := sha256.Sum256(e.Target.TaskToken)
-	return fmt.Sprintf("enroll/%s/%s/%d/%s", e.Target.ActivityID, e.Target.ActivityRunID, e.Target.Attempt, hex.EncodeToString(hash[:]))
 }
 
 type DeliveryResult struct {

@@ -79,8 +79,8 @@ try:
                     capture_output=True, text=True, timeout=min(5, max(0.1, end - time.monotonic())),
                 )
             except subprocess.TimeoutExpired as error:
-                # An initial query can race coordinator creation. The CLI's
-                # missing-execution fallback waits longer than this probe.
+                # An inspection can race creation of the PostgreSQL run row.
+                # Retry the read while the launcher starts its callers.
                 record_inspection(f"transient inspect timeout: {error}")
                 continue
             if inspection.returncode == 0:
@@ -88,8 +88,8 @@ try:
                     candidate = json.loads(inspection.stdout)
                 except json.JSONDecodeError as error:
                     raise RuntimeError("inspect returned invalid JSON: " + inspection.stdout) from error
-                if candidate.get("backing") != EXPECTED_BACKING:
-                    raise RuntimeError("hardkill verification requires Nexus-invoked SAA: " + inspection.stdout)
+                if candidate.get("backing") != EXPECTED_BACKING or candidate.get("storage") != "postgres":
+                    raise RuntimeError("hardkill verification requires PostgreSQL-backed Nexus SAA: " + inspection.stdout)
                 batches = candidate.get("batches", [])
                 if batches and batches[0].get("provider_batch_id") and batches[0].get("provider_status") == "in_progress":
                     before = candidate
@@ -121,6 +121,7 @@ try:
         proof = {"run_id": RUN_ID, "signal": "SIGKILL", "succeeded": 3,
                  "backing": report["status"]["backing"],
                  "completion_mode": report["status"]["completion_mode"],
+                 "storage": report["status"]["storage"],
                  "provider_jobs": 1, "provider_batch_id": old_id,
                  "elapsed_ns": report["elapsed_ns"], "evidence_directory": str(STATE)}
         (ROOT / ".state" / "hardkill-proof.json").write_text(json.dumps(proof, indent=2) + "\n")

@@ -27,13 +27,16 @@ func TestDocumentsRejectDuplicateAndOverrideRun(t *testing.T) {
 	if _, err = documents("run", p, 1); err == nil {
 		t.Fatal("duplicate document identity accepted")
 	}
-	if _, err = documents("run", "", 1001); err == nil {
-		t.Fatal("unbounded count accepted")
+	if docs, err = documents("run", "", 1001); err != nil || len(docs) != 1001 {
+		t.Fatal("database-backed runs must not retain the old 1000-request Workflow limit")
+	}
+	if _, err = documents("run", "", 0); err == nil {
+		t.Fatal("nonpositive document count accepted")
 	}
 }
 
 func TestCleanupOwnsOnlyTheNamedRun(t *testing.T) {
-	for _, id := range []string{"batch-coordinator/demo", "caller/demo/doc", "batch-request/demo/hash", "batch/demo-0001"} {
+	for _, id := range []string{"batch-coordinator/demo", "caller/demo/doc", "batch-request/demo/hash", "batch/demo-0001", "batch/demo-10000"} {
 		if !ownedWorkflow(id, "demo") {
 			t.Errorf("expected own id %s", id)
 		}

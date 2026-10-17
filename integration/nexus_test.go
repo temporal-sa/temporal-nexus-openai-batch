@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/model"
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/orchestration"
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/provider"
+	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/store"
 	"go.temporal.io/api/enums/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
 	"go.temporal.io/api/operatorservice/v1"
@@ -28,6 +30,7 @@ import (
 	tlog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
+	"google.golang.org/protobuf/proto"
 )
 
 // These tests deliberately use a real Temporal server, real Nexus endpoints,
@@ -49,7 +52,9 @@ func TestNexusBatchIntegration(t *testing.T) {
 	t.Run("stale_saa_attempt_token_is_fenced_without_resubmission", testStaleAttempt)
 	t.Run("successful_external_completion_ack_loss_is_reconciled", func(t *testing.T) { testCompletionAckLoss(t, "success") })
 	t.Run("failed_external_completion_ack_loss_is_reconciled", func(t *testing.T) { testCompletionAckLoss(t, "expired") })
-	t.Run("1001st_admission_is_rejected_at_the_hard_run_limit", testAdmissionBound)
+	t.Run("postgres_enrollment_commit_before_ack_is_idempotent", testEnrollmentCommitAckLoss)
+	t.Run("dispatch_start_before_database_ack_is_reconciled", testDispatchCommitGap)
+	t.Run("more_than_1000_callers_across_concurrent_workers", testBeyondThousand)
 	for _, scenario := range []struct {
 		name, code string
 		failures   int
@@ -320,7 +325,7 @@ func testDeliveryRestart(t *testing.T) {
 		t.Fatalf("read original provider batch: jobs=%v error=%v", jobs, err)
 	}
 	originalID := jobs[0].ID
-	completedBeforeStop := h.awaitPartialDelivery(model.BatchWorkflowID(h.id+"-0001"), len(runs))
+	completedBeforeStop := h.awaitPartialDelivery(model.BatchWorkflowID(h.id+"-00000001"), len(runs))
 	t.Logf("replacing service worker after %d of %d external completion Activities finished", completedBeforeStop, len(runs))
 	h.replaceWorkers()
 	for i, run := range runs {
@@ -429,50 +434,147 @@ func testCompletionAckLoss(t *testing.T, scenario string) {
 	}
 }
 
-func testAdmissionBound(t *testing.T) {
+type enrollmentAckLossRepository struct {
+	orchestration.Repository
+	calls atomic.Int32
+}
+
+func (r *enrollmentAckLossRepository) Enroll(ctx context.Context, enrollment model.Enrollment) (model.Admission, error) {
+	admission, err := r.Repository.Enroll(ctx, enrollment)
+	if err == nil && r.calls.Add(1) == 1 {
+		return model.Admission{}, serviceerror.NewUnavailable("injected acknowledgment loss after PostgreSQL enrollment committed")
+	}
+	return admission, err
+}
+
+func testEnrollmentCommitAckLoss(t *testing.T) {
+	var fault *enrollmentAckLossRepository
+	h := newHarness(t, "success", 100*time.Millisecond, true, func(h *harness) {
+		fault = &enrollmentAckLossRepository{Repository: h.repo}
+		h.repo = fault
+	})
+	cfg := h.config()
+	cfg.MaxBatchRequests = 1
+	runID := h.coordinator(cfg)
+	runs, requests := h.callers(cfg, 1)
+	var result model.Result
+	if err := runs[0].Get(h.ctx, &result); err != nil {
+		t.Fatal(err)
+	}
+	assertResult(t, requests[0], result)
+	status := h.finish(runID)
+	assertReport(t, status, 1, 1)
+	if fault.calls.Load() < 2 || h.persistedJobs() != 1 {
+		t.Fatalf("commit retry was not idempotent: admissions=%d provider jobs=%d", fault.calls.Load(), h.persistedJobs())
+	}
+	h.assertSmallBatchHistory(status.Batches[0].BatchID)
+}
+
+type dispatchGapRepository struct {
+	orchestration.Repository
+	calls             atomic.Int32
+	started, repaired chan struct{}
+}
+
+func (r *dispatchGapRepository) MarkDispatched(ctx context.Context, batchID string) error {
+	if r.calls.Add(1) == 1 {
+		close(r.started)
+		return serviceerror.NewUnavailable("injected crash boundary after Workflow start before dispatch acknowledgment")
+	}
+	err := r.Repository.MarkDispatched(ctx, batchID)
+	if err == nil {
+		select {
+		case <-r.repaired:
+		default:
+			close(r.repaired)
+		}
+	}
+	return err
+}
+
+func testDispatchCommitGap(t *testing.T) {
+	var fault *dispatchGapRepository
+	h := newHarness(t, "success", 13*time.Second, false, func(h *harness) {
+		fault = &dispatchGapRepository{Repository: h.repo, started: make(chan struct{}), repaired: make(chan struct{})}
+		h.repo = fault
+	})
+	cfg := h.config()
+	cfg.MaxBatchRequests = 1
+	runID := h.coordinator(cfg)
+	runs, requests := h.callers(cfg, 1)
+	select {
+	case <-fault.started:
+	case <-h.ctx.Done():
+		t.Fatal(h.ctx.Err())
+	}
+	workflowID := model.BatchWorkflowID(h.id + "-00000001")
+	before, err := h.c.DescribeWorkflowExecution(h.ctx, workflowID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fault.repaired:
+	case <-h.ctx.Done():
+		t.Fatal(h.ctx.Err())
+	}
+	var result model.Result
+	if err := runs[0].Get(h.ctx, &result); err != nil {
+		t.Fatal(err)
+	}
+	assertResult(t, requests[0], result)
+	status := h.finish(runID)
+	assertReport(t, status, 1, 1)
+	after, err := h.c.DescribeWorkflowExecution(h.ctx, workflowID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.WorkflowExecutionInfo.Execution.RunId != after.WorkflowExecutionInfo.Execution.RunId || h.persistedJobs() != 1 {
+		t.Fatal("dispatch acknowledgment recovery started a replacement batch execution")
+	}
+	h.assertSmallBatchHistory(status.Batches[0].BatchID)
+}
+
+func testBeyondThousand(t *testing.T) {
 	h := newHarness(t, "success", 100*time.Millisecond, false)
 	cfg := h.config()
-	cfg.Window, cfg.ResultDeadline, cfg.OperationTimeout = 2*time.Minute, 3*time.Minute, 4*time.Minute
-	cfg.MaxAdmissions, cfg.MaxBatchRequests = model.HardMaxAdmissions, model.HardMaxBatchRequests
-	coord := h.coordinator(cfg)
-	for i := 0; i <= model.HardMaxAdmissions; i++ {
-		request := h.request(i)
-		enrollment := model.Enrollment{Request: request, Target: model.CompletionTarget{
-			Namespace: h.namespace, ActivityID: fmt.Sprintf("absent-recipient/%s/%04d", h.id, i),
-			ActivityRunID: "00000000-0000-4000-8000-000000000000", TaskToken: []byte("not-an-active-task-token"), Attempt: 1,
-		}, Fingerprint: model.Fingerprint(request)}
-		handle, err := h.c.UpdateWorkflow(h.ctx, client.UpdateWorkflowOptions{
-			WorkflowID: coord.GetID(), RunID: coord.GetRunID(), UpdateID: fmt.Sprintf("admit-%04d", i),
-			UpdateName: model.EnrollUpdate, Args: []any{enrollment}, WaitForStage: client.WorkflowUpdateStageCompleted,
-		})
-		if err != nil {
-			t.Fatalf("submit admission %d: %v", i+1, err)
+	cfg.Window, cfg.MaxBatchRequests = 10*time.Second, 100
+	cfg.ResultDeadline, cfg.OperationTimeout = 2*time.Minute, 3*time.Minute
+	runID := h.coordinator(cfg)
+	extra := worker.New(h.c, h.serviceQueue, worker.Options{})
+	orchestration.RegisterService(extra, h.c, h.p, h.repo)
+	if err := extra.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Stop()
+	secondCtx, stop := context.WithCancel(h.ctx)
+	defer stop()
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- orchestration.Dispatcher(secondCtx, h.c, h.repo, "fake", h.serviceQueue, h.id) }()
+	defer func() {
+		stop()
+		if err := <-secondDone; err != nil {
+			t.Errorf("second dispatcher: %v", err)
 		}
-		var admission model.Admission
-		err = handle.Get(h.ctx, &admission)
-		if i == model.HardMaxAdmissions {
-			var application *temporal.ApplicationError
-			if !errors.As(err, &application) || application.Type() != "RUN_FULL" {
-				t.Fatalf("admission 1001 must fail with RUN_FULL, got %v", err)
-			}
-			continue
+	}()
+	runs, requests := h.callers(cfg, 1201)
+	for i, run := range runs {
+		var result model.Result
+		if err := run.Get(h.ctx, &result); err != nil {
+			t.Fatalf("caller %d of 1201: %v", i, err)
 		}
-		if err != nil {
-			t.Fatalf("admission %d below the cap: %v", i+1, err)
-		}
-		if admission.Fingerprint != enrollment.Fingerprint || admission.BatchID == "" {
-			t.Fatalf("invalid admission acknowledgment %d: %+v", i+1, admission)
+		assertResult(t, requests[i], result)
+		if i%100 == 0 {
+			h.assertNexusHistory(run, true)
 		}
 	}
-	status := h.finish(coord)
-	assertReport(t, status, model.HardMaxAdmissions, model.HardMaxAdmissions/model.HardMaxBatchRequests)
+	status := h.finish(runID)
+	assertReport(t, status, 1201, 13)
+	if h.persistedJobs() != 13 {
+		t.Fatalf("concurrent workers dispatched %d provider jobs, want13", h.persistedJobs())
+	}
+	h.assertServiceHasNoRequestWorkflows()
 	for _, report := range status.Batches {
-		if report.Requests != model.HardMaxBatchRequests || report.Skipped != report.Requests || report.Delivered != 0 {
-			t.Fatalf("fictitious recipients must be skipped while preserving bounded manifests: %+v", report)
-		}
-	}
-	if jobs := h.persistedJobs(); jobs != 10 {
-		t.Fatalf("1,000 admitted items must create exactly 10 bounded batches, got %d", jobs)
+		h.assertSmallBatchHistory(report.BatchID)
 	}
 }
 
@@ -494,7 +596,12 @@ type harness struct {
 	loseCompletionAck  bool
 	completionCalls    atomic.Int32
 	completionAttempts atomic.Int32
-	endpoint           *nexuspb.Endpoint
+	db                 *store.Store
+	repo               orchestration.Repository
+	dispatchStop       context.CancelFunc
+	dispatchDone       chan error
+
+	endpoint *nexuspb.Endpoint
 }
 
 func newHarness(t *testing.T, scenario string, delay time.Duration, captureHandoffs bool, configure ...func(*harness)) *harness {
@@ -507,7 +614,7 @@ func newHarness(t *testing.T, scenario string, delay time.Duration, captureHando
 	if namespace == "" {
 		namespace = "default"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	t.Cleanup(cancel)
 	c, err := client.DialContext(ctx, client.Options{HostPort: address, Namespace: namespace,
 		Logger: tlog.NewStructuredLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))})
@@ -517,6 +624,17 @@ func newHarness(t *testing.T, scenario string, delay time.Duration, captureHando
 	h := &harness{t: t, ctx: ctx, c: c, namespace: namespace, id: fmt.Sprintf("it-%d", time.Now().UnixNano()),
 		stateDir: t.TempDir(), scenario: scenario, delay: delay, captureHandoffs: captureHandoffs,
 		handoffs: make(chan model.CompletionTarget, 128)}
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = store.LocalDSN
+	}
+	db, err := store.Open(ctx, dsn, namespace)
+	if err != nil {
+		c.Close()
+		t.Fatal(err)
+	}
+	h.db = db
+	h.repo = db
 	h.serviceQueue, h.callerQueue = h.id+"-service", h.id+"-caller"
 	for _, apply := range configure {
 		apply(h)
@@ -547,6 +665,7 @@ func (h *harness) startCaller() {
 
 func (h *harness) replaceWorkers() {
 	h.t.Helper()
+	h.stopDispatcher()
 	h.service.Stop()
 	h.service = nil
 	h.caller.Stop()
@@ -570,11 +689,11 @@ func (h *harness) startService() {
 		options.MaxConcurrentActivityExecutionSize = 1
 	}
 	h.service = worker.New(h.c, h.serviceQueue, options)
-	orchestration.RegisterService(h.service, h.c, p)
+	orchestration.RegisterService(h.service, h.c, p, h.repo)
 	h.service.RegisterActivityWithOptions(func(context.Context) (string, error) { return "worker-slot-released", nil },
 		activity.RegisterOptions{Name: "IntegrationProbe"})
 	if h.captureHandoffs {
-		activities := &orchestration.ServiceActivities{Client: h.c, Provider: p}
+		activities := &orchestration.ServiceActivities{Client: h.c, Provider: p, Store: h.repo}
 		h.service.RegisterActivityWithOptions(func(ctx context.Context, input model.SAAInput) (model.Result, error) {
 			result, err := activities.SubmitRequest(ctx, input)
 			if errors.Is(err, activity.ErrResultPending) {
@@ -586,15 +705,22 @@ func (h *harness) startService() {
 		}, activity.RegisterOptions{Name: "SubmitRequest", DisableAlreadyRegisteredCheck: true})
 	}
 	if h.loseCompletionAck {
-		activities := &orchestration.ServiceActivities{Client: &lostCompletionAckClient{Client: h.c, calls: &h.completionCalls}, Provider: p}
-		h.service.RegisterActivityWithOptions(func(ctx context.Context, target model.CompletionTarget, outcome model.Outcome) (orchestration.DeliveryResult, error) {
+		activities := &orchestration.ServiceActivities{Client: &lostCompletionAckClient{Client: h.c, calls: &h.completionCalls}, Provider: p, Store: h.repo}
+		h.service.RegisterActivityWithOptions(func(ctx context.Context, ref model.BatchRef) (model.DeliverySummary, error) {
 			h.completionAttempts.Add(1)
-			return activities.CompleteResult(ctx, target, outcome)
-		}, activity.RegisterOptions{Name: "CompleteResult", DisableAlreadyRegisteredCheck: true})
+			return activities.Deliver(ctx, ref)
+		}, activity.RegisterOptions{Name: "Deliver", DisableAlreadyRegisteredCheck: true})
 	}
 	if err := h.service.Start(); err != nil {
 		h.t.Fatalf("start service worker: %v", err)
 	}
+	dispatchCtx, stop := context.WithCancel(h.ctx)
+	h.dispatchStop = stop
+	h.dispatchDone = make(chan error, 1)
+	go func() {
+		h.dispatchDone <- orchestration.Dispatcher(dispatchCtx, h.c, h.repo, "fake", h.serviceQueue, h.id)
+	}()
+
 }
 
 type lostCompletionAckClient struct {
@@ -614,19 +740,16 @@ func (c *lostCompletionAckClient) CompleteActivity(ctx context.Context, token []
 func (h *harness) config() model.Config {
 	cfg := model.DefaultConfig("fake")
 	cfg.Endpoint, cfg.PollInterval = h.id, 100*time.Millisecond
-	cfg.ResultDeadline, cfg.OperationTimeout = 45*time.Second, 60*time.Second
+	cfg.ResultDeadline, cfg.OperationTimeout = 45*time.Second, 2*time.Minute
 	return cfg
 }
 
-func (h *harness) coordinator(cfg model.Config) client.WorkflowRun {
+func (h *harness) coordinator(cfg model.Config) string {
 	h.t.Helper()
-	run, err := h.c.ExecuteWorkflow(h.ctx, client.StartWorkflowOptions{ID: model.CoordinatorID(h.id), TaskQueue: h.serviceQueue},
-		orchestration.CoordinatorWorkflow, model.RunInput{RunID: h.id, Config: cfg})
-	if err != nil {
-		h.t.Fatalf("start coordinator: %v", err)
+	if err := h.db.CreateRun(h.ctx, model.RunInput{RunID: h.id, Config: cfg}); err != nil {
+		h.t.Fatal(err)
 	}
-	h.runs = append(h.runs, run)
-	return run
+	return h.id
 }
 
 func (h *harness) request(i int) model.Request {
@@ -651,23 +774,24 @@ func (h *harness) callers(cfg model.Config, count int) ([]client.WorkflowRun, []
 	return runs, requests
 }
 
-func (h *harness) finish(run client.WorkflowRun) model.RunStatus {
+func (h *harness) finish(runID string) model.RunStatus {
 	h.t.Helper()
-	handle, err := h.c.UpdateWorkflow(h.ctx, client.UpdateWorkflowOptions{
-		WorkflowID: run.GetID(), RunID: run.GetRunID(), UpdateID: "integration-finish", UpdateName: model.FinishUpdate,
-		WaitForStage: client.WorkflowUpdateStageCompleted,
-	})
-	if err != nil {
-		h.t.Fatalf("close coordinator admission: %v", err)
-	}
-	if err := handle.Get(h.ctx, nil); err != nil {
+	if err := h.db.CloseRun(h.ctx, runID); err != nil {
 		h.t.Fatal(err)
 	}
-	var status model.RunStatus
-	if err := run.Get(h.ctx, &status); err != nil {
-		h.t.Fatalf("finish coordinator: %v", err)
-	}
-	return status
+	return h.awaitStatus(func(status model.RunStatus) bool {
+		if !status.Closed || status.Buffered != 0 {
+			return false
+		}
+		count := 0
+		for _, report := range status.Batches {
+			if (report.Status != "completed" && report.Status != "completed_with_errors") || report.Succeeded+report.Failed != report.Requests || report.Delivered+report.Skipped != report.Requests {
+				return false
+			}
+			count += report.Requests
+		}
+		return count == status.Admitted
+	})
 }
 
 func (h *harness) persistedJobs() int {
@@ -710,17 +834,15 @@ func (h *harness) awaitJobs(count int) {
 
 func (h *harness) awaitStatus(ready func(model.RunStatus) bool) model.RunStatus {
 	h.t.Helper()
-	deadline := time.NewTimer(15 * time.Second)
+	deadline := time.NewTimer(3 * time.Minute)
 	defer deadline.Stop()
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	var last model.RunStatus
 	for {
-		value, err := h.c.QueryWorkflow(h.ctx, model.CoordinatorID(h.id), "", model.StatusQuery)
+		value, err := h.db.Status(h.ctx, h.id)
 		if err == nil {
-			if err := value.Get(&last); err != nil {
-				h.t.Fatal(err)
-			}
+			last = value
 			if ready(last) {
 				return last
 			}
@@ -737,38 +859,21 @@ func (h *harness) awaitStatus(ready func(model.RunStatus) bool) model.RunStatus 
 
 func (h *harness) awaitPartialDelivery(batchWorkflowID string, total int) int {
 	h.t.Helper()
-	deadline := time.NewTimer(30 * time.Second)
-	defer deadline.Stop()
-	tick := time.NewTicker(20 * time.Millisecond)
-	defer tick.Stop()
 	for {
-		completionActivities := make(map[int64]bool)
-		completed := 0
-		iter := h.c.GetWorkflowHistory(h.ctx, batchWorkflowID, "", false, enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
-		for iter.HasNext() {
-			event, err := iter.Next()
-			if err != nil {
-				h.t.Fatalf("read batch delivery history: %v", err)
-			}
-			if scheduled := event.GetActivityTaskScheduledEventAttributes(); scheduled != nil && scheduled.ActivityType.Name == "CompleteResult" {
-				completionActivities[event.EventId] = true
-			}
-			if activity := event.GetActivityTaskCompletedEventAttributes(); activity != nil && completionActivities[activity.ScheduledEventId] {
-				completed++
-			}
+		summary, err := h.db.DeliverySummary(h.ctx, strings.TrimPrefix(batchWorkflowID, "batch/"))
+		if err != nil {
+			h.t.Fatal(err)
 		}
-		if completed > 0 && completed < total {
-			return completed
+		if summary.Delivered > 0 && summary.Delivered < total {
+			return summary.Delivered
 		}
-		if completed == total {
-			h.t.Fatal("all external completion Activities finished before the test could interrupt the service worker")
+		if summary.Delivered == total {
+			h.t.Fatal("all database-checkpointed deliveries finished before interruption")
 		}
 		select {
 		case <-h.ctx.Done():
 			h.t.Fatal(h.ctx.Err())
-		case <-deadline.C:
-			h.t.Fatal("batch did not begin result delivery before worker replacement deadline")
-		case <-tick.C:
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
 }
@@ -892,7 +997,7 @@ func (h *harness) assertServiceHasNoRequestWorkflows() {
 		h.t.Fatal(err)
 	}
 	for _, execution := range response.Executions {
-		if execution.Type.Name != "CoordinatorWorkflow" && execution.Type.Name != "BatchWorkflow" {
+		if execution.Type.Name != "BatchWorkflow" {
 			h.t.Fatalf("service started a per-request or unexpected Workflow: %s", execution.Type.Name)
 		}
 	}
@@ -937,6 +1042,8 @@ func (h *harness) assertNexusHistory(run client.WorkflowRun, success bool) {
 func (h *harness) cleanup() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	h.stopDispatcher()
+	_ = h.db.StopRun(ctx, h.id)
 	// Never enumerate or mutate an unrelated queue. Clean the actual SAAs and
 	// abandoned batch children if an assertion failed before external completion.
 	activityList, err := h.c.ListActivities(ctx, client.ListActivitiesOptions{Query: fmt.Sprintf("TaskQueue = '%s'", h.serviceQueue)})
@@ -980,6 +1087,7 @@ func (h *harness) cleanup() {
 		}
 	}
 	h.c.Close()
+	h.db.Close()
 }
 
 func assertResult(t *testing.T, request model.Request, result model.Result) {
@@ -1018,6 +1126,9 @@ func assertReport(t *testing.T, status model.RunStatus, requests, batches int) {
 	if status.Backing != "nexus_standalone_activity" || status.CompletionMode != "external_async_completion_legacy" {
 		t.Fatalf("report must identify actual SAA backing and the public SDK's completion mode: %+v", status)
 	}
+	if status.Storage != "postgres" {
+		t.Fatalf("run state did not come from external PostgreSQL storage: %+v", status)
+	}
 	if !status.Closed || status.Buffered != 0 || status.Admitted != requests || len(status.Batches) != batches {
 		t.Fatalf("incorrect final run accounting: %+v; want %d admissions, %d batches", status, requests, batches)
 	}
@@ -1034,5 +1145,56 @@ func assertReport(t *testing.T, status model.RunStatus, requests, batches int) {
 	}
 	if total != requests {
 		t.Fatalf("manifests contain %d entries, want %d", total, requests)
+	}
+}
+
+func (h *harness) stopDispatcher() {
+	if h.dispatchStop == nil {
+		return
+	}
+	h.dispatchStop()
+	err := <-h.dispatchDone
+	h.dispatchStop = nil
+	if err != nil && !errors.Is(err, context.Canceled) {
+		h.t.Errorf("dispatcher stopped unexpectedly: %v", err)
+	}
+}
+func (h *harness) assertSmallBatchHistory(batchID string) {
+	h.t.Helper()
+	iter := h.c.GetWorkflowHistory(h.ctx, model.BatchWorkflowID(batchID), "", false, enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	events, scheduled, polls := 0, 0, 0
+	for iter.HasNext() {
+		event, err := iter.Next()
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		events++
+		data, err := proto.Marshal(event)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		for _, forbidden := range []string{`"task_token"`, `"completion_target"`, `"request_id"`, `"entries"`, "Summarize document ", "Fake response:", "nexus_batch@"} {
+			if bytes.Contains(data, []byte(forbidden)) {
+				h.t.Fatalf("batch workflow history leaked per-request data or credentials: %s", forbidden)
+			}
+		}
+		if attr := event.GetWorkflowExecutionStartedEventAttributes(); attr != nil {
+			for _, p := range attr.Input.Payloads {
+				if len(p.Data) > 4096 {
+					h.t.Fatalf("batch reference grew to %d bytes", len(p.Data))
+				}
+			}
+		}
+		if scheduledActivity := event.GetActivityTaskScheduledEventAttributes(); scheduledActivity != nil {
+			scheduled++
+			if scheduledActivity.ActivityType.Name == "Retrieve" {
+				polls++
+			}
+		}
+	}
+	// Durable provider polling grows with elapsed time. Exclude that fixed
+	// polling loop when checking that orchestration does not grow per item.
+	if events-12*polls > 150 || scheduled-polls > 20 {
+		h.t.Fatalf("batch history grew with item count: events=%d Activities=%d", events, scheduled)
 	}
 }

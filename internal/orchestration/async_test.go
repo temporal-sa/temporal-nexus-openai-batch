@@ -3,6 +3,7 @@ package orchestration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -19,16 +20,28 @@ import (
 	"go.temporal.io/sdk/testsuite"
 )
 
-func TestConfigurationQueryFailurePreservesNexusRetryability(t *testing.T) {
-	missing := configurationQueryError(serviceerror.NewNotFound("raw internal resource name"))
+func TestConfigurationLookupFailurePreservesNexusRetryability(t *testing.T) {
+	missing := configurationLookupError(serviceerror.NewNotFound("raw internal resource name"))
 	require.Equal(t, nexus.HandlerErrorTypeBadRequest, missing.Type)
 	require.False(t, missing.Retryable())
 	for _, cause := range []error{serviceerror.NewUnavailable("raw internal transport details"), context.DeadlineExceeded, errors.New("raw internal query-task details")} {
-		transient := configurationQueryError(cause)
+		transient := configurationLookupError(cause)
 		require.Equal(t, nexus.HandlerErrorTypeUnavailable, transient.Type)
 		require.True(t, transient.Retryable())
 		require.NotContains(t, transient.Error(), "raw internal")
 	}
+}
+
+func TestIngressEndpointIsolationRejectsMisroutedRun(t *testing.T) {
+	require.NoError(t, validateIngressEndpoint("service-live", "service-live"))
+	require.NoError(t, validateIngressEndpoint("service-live", ""))
+	err := validateIngressEndpoint("service-live", "service-fake")
+	var handler *nexus.HandlerError
+	require.ErrorAs(t, err, &handler)
+	require.Equal(t, nexus.HandlerErrorTypeBadRequest, handler.Type)
+	require.False(t, handler.Retryable())
+	require.NotContains(t, err.Error(), "service-live")
+	require.NotContains(t, err.Error(), "service-fake")
 }
 
 type descriptionHandle struct {
@@ -122,28 +135,87 @@ func TestCompletionReturnsTransientFailureForSafeRetry(t *testing.T) {
 	c.AssertExpectations(t)
 }
 
+type enrollmentRepository struct {
+	Repository
+	enroll func(model.Enrollment) (model.Admission, error)
+}
+
+func (r enrollmentRepository) Enroll(_ context.Context, e model.Enrollment) (model.Admission, error) {
+	return r.enroll(e)
+}
 func TestSubmitRequestPersistsAttemptThenReturnsPending(t *testing.T) {
-	var c mocks.Client
-	var updateHandle mocks.WorkflowUpdateHandle
 	input := model.SAAInput{Request: testEnrollment("1").Request, Config: model.DefaultConfig("fake")}
 	var target model.CompletionTarget
-	c.On("UpdateWorkflow", mock.Anything, mock.MatchedBy(func(options client.UpdateWorkflowOptions) bool {
-		if len(options.Args) != 1 {
-			return false
-		}
-		enrollment := options.Args[0].(model.Enrollment)
-		target = enrollment.Target
-		return options.UpdateID == enrollmentUpdateID(enrollment) && options.WorkflowID == model.CoordinatorID("test") && options.WaitForStage == client.WorkflowUpdateStageCompleted && enrollment.Request == input.Request && enrollment.Fingerprint == model.Fingerprint(input.Request) && target.ActivityRunID != "" && target.Namespace != "" && target.Attempt == 1 && len(target.TaskToken) > 0
-	})).Return(&updateHandle, nil).Once()
-	updateHandle.On("Get", mock.Anything, mock.Anything).Return(nil).Once()
+	repo := enrollmentRepository{enroll: func(e model.Enrollment) (model.Admission, error) {
+		require.Equal(t, input.Request, e.Request)
+		require.Equal(t, model.Fingerprint(input.Request), e.Fingerprint)
+		target = e.Target
+		require.NotEmpty(t, target.ActivityRunID)
+		require.NotEmpty(t, target.Namespace)
+		require.NotEmpty(t, target.TaskToken)
+		require.EqualValues(t, 1, target.Attempt)
+		return model.Admission{BatchID: "test-0001", Fingerprint: e.Fingerprint, Config: input.Config}, nil
+	}}
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
 	env.SetExecuteActivitiesInWorkflow(false)
-	a := ServiceActivities{Client: &c}
+	a := ServiceActivities{Store: repo}
 	env.RegisterActivity(&a)
 	_, err := env.ExecuteActivity(a.SubmitRequest, input)
 	require.ErrorIs(t, err, activity.ErrResultPending)
 	require.NotEmpty(t, target.ActivityRunID)
+}
+
+type pagedDeliveryRepository struct {
+	Repository
+	rows      []model.StoredDelivery
+	marked    map[string]bool
+	pageSizes []int
+}
+
+func (r *pagedDeliveryRepository) PendingDeliveries(_ context.Context, _ string, limit int) ([]model.StoredDelivery, error) {
+	var page []model.StoredDelivery
+	for _, row := range r.rows {
+		if !r.marked[row.RequestID] {
+			page = append(page, row)
+			if len(page) == limit {
+				break
+			}
+		}
+	}
+	if len(page) > 0 {
+		r.pageSizes = append(r.pageSizes, len(page))
+	}
+	return page, nil
+}
+func (r *pagedDeliveryRepository) MarkDelivered(_ context.Context, _ string, requestID string, delivered bool, _ string) error {
+	r.marked[requestID] = delivered
+	return nil
+}
+func (r *pagedDeliveryRepository) DeliverySummary(context.Context, string) (model.DeliverySummary, error) {
+	return model.DeliverySummary{Delivered: len(r.marked), Succeeded: len(r.rows)}, nil
+}
+func TestAggregateDeliveryPagesMoreThanOneThousandTargets(t *testing.T) {
+	repo := &pagedDeliveryRepository{marked: map[string]bool{}}
+	targets := map[string]model.CompletionTarget{}
+	for i := 0; i < 1001; i++ {
+		e := testEnrollment(fmt.Sprint(i))
+		targets[e.Target.ActivityID] = e.Target
+		repo.rows = append(repo.rows, model.StoredDelivery{RequestID: e.Request.RequestID, Target: e.Target, Outcome: model.Outcome{RequestID: e.Request.RequestID, Result: &model.Result{RequestID: e.Request.RequestID, Text: "result"}}})
+	}
+	var c mocks.Client
+	c.On("GetActivityHandle", mock.Anything).Return(func(options client.GetActivityHandleOptions) client.ActivityHandle {
+		target := targets[options.ActivityID]
+		return descriptionHandle{describe: func() (*client.ActivityExecutionDescription, error) { return runningDescription(target), nil }}
+	}).Times(1001)
+	c.On("CompleteActivity", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Times(1001)
+	a := ServiceActivities{Client: &c, Store: repo}
+	summary, err := a.Deliver(context.Background(), model.BatchRef{BatchID: "test-0001"})
+	require.NoError(t, err)
+	require.Equal(t, 1001, summary.Delivered)
+	require.Len(t, repo.pageSizes, 11)
+	for _, size := range repo.pageSizes {
+		require.LessOrEqual(t, size, 100)
+	}
 	c.AssertExpectations(t)
-	updateHandle.AssertExpectations(t)
 }

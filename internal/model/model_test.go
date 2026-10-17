@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRequestAndConfigBounds(t *testing.T) {
@@ -22,12 +23,37 @@ func TestRequestAndConfigBounds(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	for _, mutate := range []func(*Config){func(c *Config) { c.MaxBatchRequests = 101 }, func(c *Config) { c.MaxAdmissions = 1001 }, func(c *Config) { c.MaxBatchBytes = HardMaxBatchBytes + 1 }, func(c *Config) { c.OperationTimeout = c.ResultDeadline }, func(c *Config) { c.PollInterval = 0 }} {
+	for _, mutate := range []func(*Config){func(c *Config) { c.MaxBatchRequests = HardMaxBatchRequests + 1 }, func(c *Config) { c.MaxAdmissions = -1 }, func(c *Config) { c.MaxBatchBytes = HardMaxBatchBytes + 1 }, func(c *Config) { c.OperationTimeout = c.ResultDeadline }, func(c *Config) { c.PollInterval = 0 }} {
 		x := c
 		mutate(&x)
 		if err := x.Validate(); err == nil {
 			t.Fatal("accepted invalid config")
 		}
+	}
+}
+
+func TestOperationTimeoutIncludesCollectionAndProviderBudget(t *testing.T) {
+	c := DefaultConfig("live")
+	c.Model = "test-model"
+	c.Window = 24 * time.Hour
+	if err := c.Validate(); err == nil {
+		t.Fatal("accepted 49-hour collection/provider budget behind a 26-hour Activity timeout")
+	}
+	c = DefaultConfig("fake")
+	c.OperationTimeout = c.Window + c.ResultDeadline
+	if err := c.Validate(); err == nil {
+		t.Fatal("accepted exact budget with no completion margin")
+	}
+	c.OperationTimeout++
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// Addition would overflow int64; subtraction must still reject the budget.
+	c.Window = time.Duration(4_000_000_000_000_000_000)
+	c.ResultDeadline = time.Duration(6_000_000_000_000_000_000)
+	c.OperationTimeout = time.Duration(9_000_000_000_000_000_000)
+	if err := c.Validate(); err == nil {
+		t.Fatal("overflowing combined budget was accepted")
 	}
 }
 
@@ -71,5 +97,26 @@ func TestJSONLCountsEncodedBytesAndPreservesInput(t *testing.T) {
 	r.Input += "."
 	if Fingerprint(r) == Fingerprint(m.Entries[0].Request) {
 		t.Fatal("changed input shares fingerprint")
+	}
+}
+
+func TestExternalStoreLimitsAllowLargeRunsAndBatches(t *testing.T) {
+	c := DefaultConfig("fake")
+	if c.MaxAdmissions != 0 {
+		t.Fatal("default admission must be unlimited")
+	}
+	c.MaxAdmissions = 25_000
+	c.MaxBatchRequests = 50_000
+	c.MaxBatchBytes = 200_000_000
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	ref := BatchRef{RunID: "run", BatchID: "run-0001", Config: c, Requests: 20_000, Bytes: 42_000_000}
+	data, err := json.Marshal(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) > 2048 {
+		t.Fatalf("batch reference unexpectedly large: %d", len(data))
 	}
 }
