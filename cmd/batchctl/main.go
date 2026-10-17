@@ -76,8 +76,8 @@ func openStore(ctx context.Context, namespace string) (*store.Store, error) {
 	return db, nil
 }
 
-func migrate(args []string) error {
-	f := flag.NewFlagSet("migrate", flag.ContinueOnError)
+func initializeDatabase(args []string) error {
+	f := flag.NewFlagSet("init-db", flag.ContinueOnError)
 	var conn connection
 	conn.flags(f)
 	if err := f.Parse(args); err != nil {
@@ -97,7 +97,6 @@ func capabilities(args []string) error {
 	f := flag.NewFlagSet("capabilities", flag.ContinueOnError)
 	var conn connection
 	conn.flags(f)
-	require := f.Bool("require-handoff", false, "fail unless first-class handoff with separate phase timeouts and retries is available")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
@@ -118,28 +117,19 @@ func capabilities(args []string) error {
 	}
 	report := map[string]any{"server_version": system.GetServerVersion(), "namespace": conn.namespace,
 		"standalone_activities": ns.GetNamespaceInfo().GetCapabilities().GetStandaloneActivities(),
-		"nexus_backing":         "standalone_activity", "completion_mode": "external_async_completion_legacy",
-		"first_class_async_handoff":           false,
-		"separate_phase_timeouts_and_retries": false,
-		"note":                                "The pinned SDK/API use conventional external async completion. ErrResultPending releases the worker slot while ordinary Activity timeouts continue; separate handoff and completion phase timeouts and retry policies are unsupported."}
-	if err = printJSON(report); err != nil {
-		return err
-	}
-	if *require {
-		return fmt.Errorf("first-class async handoff is unavailable in the pinned public SDK/API; supply an implementing server/API/SDK build")
-	}
-	return nil
+		"nexus_backing":         "standalone_activity", "completion_mode": "external_async_completion"}
+	return printJSON(report)
 }
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: batchctl <worker|demo|inspect|finish|cancel|cleanup|capabilities|migrate> [flags]; see README.md")
+		return fmt.Errorf("usage: batchctl <worker|demo|inspect|finish|cancel|cleanup|capabilities|init-db> [flags]; see README.md")
 	}
 	switch args[0] {
 	case "capabilities":
 		return capabilities(args[1:])
-	case "migrate":
-		return migrate(args[1:])
+	case "init-db":
+		return initializeDatabase(args[1:])
 	case "worker":
 		return runWorker(args[1:])
 	case "demo":
@@ -196,7 +186,7 @@ func runWorker(args []string) error {
 	defer c.Close()
 	sw := worker.New(c, serviceQueue(*mode), worker.Options{MaxConcurrentActivityExecutionSize: *serviceSlots, WorkerStopTimeout: 5 * time.Second})
 	orchestration.RegisterService(sw, c, p, db)
-	batchQueue := serviceQueue(*mode) + "-batches-v2"
+	batchQueue := serviceQueue(*mode) + "-batches"
 	bw := worker.New(c, batchQueue, worker.Options{MaxConcurrentActivityExecutionSize: *batchSlots, WorkerStopTimeout: 5 * time.Second})
 	orchestration.RegisterBatch(bw, c, p, db)
 	cw := worker.New(c, model.CallerTaskQueue, worker.Options{})
@@ -538,7 +528,7 @@ func control(command string, args []string) error {
 // Select only exact prototype IDs. The extra local check keeps run "demo" from
 // touching another run named "demo-other" when listing batch prefixes.
 func ownedWorkflow(id, runID string) bool {
-	if id == "batch-coordinator/"+runID || strings.HasPrefix(id, "caller/"+runID+"/") || strings.HasPrefix(id, "batch-request/"+runID+"/") {
+	if strings.HasPrefix(id, "caller/"+runID+"/") {
 		return true
 	}
 	prefix := "batch/" + runID + "-"
@@ -557,7 +547,7 @@ func ownedWorkflow(id, runID string) bool {
 	return true
 }
 func cleanup(ctx context.Context, c client.Client, runID string, trackedBatches []string, trackedTargets []model.CompletionTarget) error {
-	q := fmt.Sprintf("ExecutionStatus = 'Running' AND (WorkflowId = 'batch-coordinator/%s' OR WorkflowId STARTS_WITH 'caller/%s/' OR WorkflowId STARTS_WITH 'batch-request/%s/' OR WorkflowId STARTS_WITH 'batch/%s-')", runID, runID, runID, runID)
+	q := fmt.Sprintf("ExecutionStatus = 'Running' AND (WorkflowId STARTS_WITH 'caller/%s/' OR WorkflowId STARTS_WITH 'batch/%s-')", runID, runID)
 	var ids []string
 	seenIDs := map[string]bool{}
 	for _, batchID := range trackedBatches {

@@ -73,7 +73,7 @@ func TestNexusBatchIntegration(t *testing.T) {
 			h := newHarness(t, scenario.name, 100*time.Millisecond, false)
 			cfg := h.config()
 			cfg.Window, cfg.MaxBatchRequests = 10*time.Second, 6
-			coord := h.coordinator(cfg)
+			coord := h.createRun(cfg)
 			runs, requests := h.callers(cfg, 6)
 			failed := 0
 			for i, run := range runs {
@@ -115,7 +115,7 @@ func testHundredCallers(t *testing.T) {
 	h := newHarness(t, "success", 100*time.Millisecond, false)
 	cfg := h.config()
 	cfg.Window, cfg.MaxBatchRequests = 15*time.Second, 25
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 100)
 	for i, run := range runs {
 		var result model.Result
@@ -145,7 +145,7 @@ func testSparseWindow(t *testing.T) {
 	h := newHarness(t, "success", 100*time.Millisecond, false)
 	cfg := h.config()
 	cfg.Window = 500 * time.Millisecond
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	var result model.Result
 	if err := runs[0].Get(h.ctx, &result); err != nil {
@@ -168,7 +168,7 @@ func testByteLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.MaxBatchBytes = 2*len(line) - 1
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 4)
 	for i, run := range runs {
 		var result model.Result
@@ -190,7 +190,7 @@ func testAsyncHandoff(t *testing.T) {
 	h := newHarness(t, "success", 3*time.Second, true)
 	cfg := h.config()
 	cfg.Window = 150 * time.Millisecond
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	target := h.waitHandoff()
 	h.assertReleasedWorker(target)
@@ -216,7 +216,7 @@ func testDuplicateRequest(t *testing.T) {
 	h := newHarness(t, "success", 100*time.Millisecond, false)
 	cfg := h.config()
 	cfg.Window = 150 * time.Millisecond
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	var result model.Result
 	if err := runs[0].Get(h.ctx, &result); err != nil {
@@ -245,7 +245,7 @@ func testCancellation(t *testing.T) {
 	h := newHarness(t, "success", 3*time.Second, false)
 	cfg := h.config()
 	cfg.Window, cfg.MaxBatchRequests = 10*time.Second, 2
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 2)
 	h.awaitJobs(1)
 	if err := h.c.CancelWorkflow(h.ctx, runs[0].GetID(), runs[0].GetRunID()); err != nil {
@@ -277,7 +277,7 @@ func testRestart(t *testing.T) {
 	h := newHarness(t, "success", 3*time.Second, false)
 	cfg := h.config()
 	cfg.Window, cfg.MaxBatchRequests = 10*time.Second, 3
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 3)
 	h.awaitJobs(1)
 	jobs, err := h.p.Find(h.ctx, map[string]string{"run_id": h.id})
@@ -317,7 +317,7 @@ func testDeliveryRestart(t *testing.T) {
 	h := newHarness(t, "success", 100*time.Millisecond, false)
 	cfg := h.config()
 	cfg.Window, cfg.MaxBatchRequests = 15*time.Second, 100
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 100)
 	h.awaitJobs(1)
 	jobs, err := h.p.Find(h.ctx, map[string]string{"run_id": h.id})
@@ -348,7 +348,7 @@ func testHandoffRestart(t *testing.T) {
 	h := newHarness(t, "success", 2*time.Second, true)
 	cfg := h.config()
 	cfg.Window = 500 * time.Millisecond
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	target := h.waitHandoff()
 	h.assertReleasedWorker(target)
@@ -375,7 +375,7 @@ func testStaleAttempt(t *testing.T) {
 	cfg := h.config()
 	cfg.Window = 150 * time.Millisecond
 	cfg.ResultDeadline, cfg.OperationTimeout = 6*time.Second, 8*time.Second
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	request := h.request(0)
 	// Force a superseding attempt, then prove the old token stays fenced while
 	// the new attempt reattaches to the original batch and receives its result.
@@ -416,7 +416,7 @@ func testCompletionAckLoss(t *testing.T, scenario string) {
 	h := newHarness(t, scenario, 100*time.Millisecond, false, func(h *harness) { h.loseCompletionAck = true })
 	cfg := h.config()
 	cfg.Window, cfg.MaxBatchRequests = 10*time.Second, 1
-	coord := h.coordinator(cfg)
+	coord := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	var result model.Result
 	err := runs[0].Get(h.ctx, &result)
@@ -460,7 +460,7 @@ func testEnrollmentCommitAckLoss(t *testing.T) {
 	})
 	cfg := h.config()
 	cfg.MaxBatchRequests = 1
-	runID := h.coordinator(cfg)
+	runID := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	var result model.Result
 	if err := runs[0].Get(h.ctx, &result); err != nil {
@@ -505,7 +505,7 @@ func testDispatchCommitGap(t *testing.T) {
 	})
 	cfg := h.config()
 	cfg.MaxBatchRequests = 1
-	runID := h.coordinator(cfg)
+	runID := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	select {
 	case <-fault.started:
@@ -544,9 +544,10 @@ func testBeyondThousand(t *testing.T) {
 	cfg := h.config()
 	cfg.Window, cfg.MaxBatchRequests = 10*time.Second, 100
 	cfg.ResultDeadline, cfg.OperationTimeout = 2*time.Minute, 3*time.Minute
-	runID := h.coordinator(cfg)
+	runID := h.createRun(cfg)
 	extra := worker.New(h.c, h.serviceQueue, worker.Options{})
 	orchestration.RegisterService(extra, h.c, h.p, h.repo)
+	orchestration.RegisterBatch(extra, h.c, h.p, h.repo)
 	if err := extra.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -695,6 +696,7 @@ func (h *harness) startService() {
 	}
 	h.service = worker.New(h.c, h.serviceQueue, options)
 	orchestration.RegisterService(h.service, h.c, p, h.repo)
+	orchestration.RegisterBatch(h.service, h.c, p, h.repo)
 	h.service.RegisterActivityWithOptions(func(context.Context) (string, error) { return "worker-slot-released", nil },
 		activity.RegisterOptions{Name: "IntegrationProbe"})
 	if h.captureHandoffs {
@@ -749,7 +751,7 @@ func (h *harness) config() model.Config {
 	return cfg
 }
 
-func (h *harness) coordinator(cfg model.Config) string {
+func (h *harness) createRun(cfg model.Config) string {
 	h.t.Helper()
 	if err := h.db.CreateRun(h.ctx, model.RunInput{RunID: h.id, Config: cfg}); err != nil {
 		h.t.Fatal(err)
@@ -856,7 +858,7 @@ func (h *harness) awaitStatus(ready func(model.RunStatus) bool) model.RunStatus 
 		case <-h.ctx.Done():
 			h.t.Fatal(h.ctx.Err())
 		case <-deadline.C:
-			h.t.Fatalf("coordinator did not expose expected in-flight progress: %+v", last)
+			h.t.Fatalf("run did not expose expected in-flight progress: %+v", last)
 		case <-tick.C:
 		}
 	}
@@ -1002,7 +1004,7 @@ func (h *harness) assertServiceHasNoRequestWorkflows() {
 		h.t.Fatal(err)
 	}
 	for _, execution := range response.Executions {
-		if execution.Type.Name != "BatchWorkflow" && execution.Type.Name != orchestration.BatchWorkflowType {
+		if execution.Type.Name != "BatchWorkflow" {
 			h.t.Fatalf("service started a per-request or unexpected Workflow: %s", execution.Type.Name)
 		}
 	}
@@ -1128,7 +1130,7 @@ func assertFailureCode(t *testing.T, err error, code string) {
 
 func assertReport(t *testing.T, status model.RunStatus, requests, batches int) {
 	t.Helper()
-	if status.Backing != "nexus_standalone_activity" || status.CompletionMode != "external_async_completion_legacy" {
+	if status.Backing != "nexus_standalone_activity" || status.CompletionMode != "external_async_completion" {
 		t.Fatalf("report must identify actual SAA backing and the public SDK's completion mode: %+v", status)
 	}
 	if status.Storage != "postgres" {

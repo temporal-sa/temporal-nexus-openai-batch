@@ -28,22 +28,20 @@ func RequestActivityID(r model.Request, nexusRequestID string) string {
 	return "request-activity/" + r.RunID + "/" + hex.EncodeToString(h[:])
 }
 
-const BatchWorkflowType = "BatchWorkflowV2"
-
 func RegisterBatch(w worker.Worker, c client.Client, p provider.Provider, repo Repository) {
-	w.RegisterWorkflowWithOptions(BatchWorkflowLegacy, workflow.RegisterOptions{Name: "BatchWorkflow"})
-	w.RegisterWorkflowWithOptions(BatchWorkflowV2, workflow.RegisterOptions{Name: BatchWorkflowType})
+	w.RegisterWorkflow(BatchWorkflow)
 	activities := &ServiceActivities{Client: c, Provider: p, Store: repo}
 	// Enrollment and exact-token completion are plain helpers inside these
 	// Activities. They are not registered as per-request Workflow Activities.
-	for _, implementation := range []any{activities.SubmitRequest, activities.Upload, activities.Create, activities.Find,
-		activities.Retrieve, activities.Poll, activities.Results, activities.FailBatch, activities.SaveReport, activities.Deliver} {
+	for _, implementation := range []any{activities.Upload, activities.Create, activities.Find,
+		activities.Poll, activities.Results, activities.FailBatch, activities.SaveReport, activities.Deliver} {
 		w.RegisterActivity(implementation)
 	}
 }
 
 func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo Repository) {
-	RegisterBatch(w, c, p, repo)
+	activities := &ServiceActivities{Client: c, Provider: p, Store: repo}
+	w.RegisterActivity(activities.SubmitRequest)
 	op := temporalnexus.MustNewTemporalOperation(temporalnexus.TemporalOperationOptions[model.Request, model.Result]{
 		Name: model.Operation,
 		Start: func(ctx context.Context, nc temporalnexus.NexusClient, input model.Request, opts temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[model.Result], error) {
@@ -71,8 +69,8 @@ func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo
 				ActivityIDReusePolicy:  enums.ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE,
 			}, serviceActivities.SubmitRequest, model.SAAInput{Request: input, Config: config})
 			if err == nil {
-				// SDK 1.49 propagates callbacks into StartActivity but does not add the
-				// reverse link to NexusOperationStarted. Add the pinned Activity link.
+				// Link the caller's Nexus operation to its exact standalone
+				// Activity execution for inspection in Workflow history.
 				if description, describeErr := nc.GetWorkflowClient().GetActivityHandle(client.GetActivityHandleOptions{ActivityID: activityID}).Describe(ctx, client.DescribeActivityOptions{}); describeErr == nil {
 					nexus.AddHandlerLinks(ctx, temporalnexus.ConvertLinkActivityToNexusLink(&commonpb.Link_Activity{
 						Namespace: temporalnexus.GetOperationInfo(ctx).Namespace, ActivityId: activityID, RunId: description.ActivityRunID,
@@ -90,8 +88,7 @@ func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo
 }
 
 func validateIngressEndpoint(configured, actual string) error {
-	// Endpoint is populated by servers >=1.30. Older servers leave it empty.
-	if actual != "" && actual != configured {
+	if actual != configured {
 		return nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "batching run belongs to another Nexus endpoint")
 	}
 	return nil
@@ -235,10 +232,6 @@ func (a *ServiceActivities) Find(ctx context.Context, ref model.BatchRef, fileID
 		return CreateResult{Ambiguous: true, Failure: "provider submission could not be uniquely reconciled"}, nil
 	}
 	return CreateResult{Job: controlJob(match)}, nil
-}
-func (a *ServiceActivities) Retrieve(ctx context.Context, id string) (provider.Job, error) {
-	job, err := a.Provider.Retrieve(ctx, id)
-	return controlJob(job), providerError(err)
 }
 
 func controlJob(job provider.Job) provider.Job {

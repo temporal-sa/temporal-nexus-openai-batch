@@ -122,7 +122,7 @@ type Enrollment struct {
 	Request     Request          `json:"request"`
 	Target      CompletionTarget `json:"completion_target"`
 	Fingerprint string           `json:"fingerprint"`
-	DeadlineAt  time.Time        `json:"deadline_at,omitempty"`
+	DeadlineAt  time.Time        `json:"deadline_at"`
 }
 
 // CompletionTarget fences external completion to the exact standalone Activity
@@ -172,7 +172,7 @@ type BatchRef struct {
 	Bytes           int       `json:"bytes"`
 	SealedAt        time.Time `json:"sealed_at"`
 	FirstAdmittedAt time.Time `json:"first_admitted_at"`
-	DeadlineAt      time.Time `json:"deadline_at,omitempty"`
+	DeadlineAt      time.Time `json:"deadline_at"`
 }
 
 // StoredDelivery is loaded and consumed within an Activity, never a Workflow.

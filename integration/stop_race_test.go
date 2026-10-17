@@ -46,7 +46,7 @@ func TestNexusStopFencesAlreadyClaimedBatch(t *testing.T) {
 	t.Cleanup(unpause)
 	cfg := h.config()
 	cfg.MaxBatchRequests = 1
-	runID := h.coordinator(cfg)
+	runID := h.createRun(cfg)
 	h.callers(cfg, 1)
 	var ref model.BatchRef
 	select {

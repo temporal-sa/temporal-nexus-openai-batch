@@ -31,15 +31,6 @@ func boundedActivityContext(ctx workflow.Context, deadline time.Time, oneAttempt
 	return workflow.WithActivityOptions(ctx, options)
 }
 
-func storageActivityOptions(ctx workflow.Context, deadline time.Time) workflow.ActivityOptions {
-	remaining := deadline.Sub(workflow.Now(ctx))
-	if remaining <= 0 {
-		remaining = time.Nanosecond
-	}
-	return workflow.ActivityOptions{StartToCloseTimeout: min(30*time.Second, remaining), ScheduleToCloseTimeout: remaining,
-		RetryPolicy: &temporal.RetryPolicy{InitialInterval: time.Second, MaximumInterval: 10 * time.Second}}
-}
-
 func bulkProviderContext(ctx workflow.Context, deadline time.Time) workflow.Context {
 	options := safeOptions()
 	remaining := deadline.Sub(workflow.Now(ctx))
@@ -84,15 +75,15 @@ func pollingActivityOptions(ctx workflow.Context, deadline time.Time) workflow.A
 		RetryPolicy:      &temporal.RetryPolicy{InitialInterval: time.Second, MaximumInterval: 10 * time.Second}}
 }
 
-// BatchWorkflowV2 keeps only one small reference and provider control metadata.
+// BatchWorkflow keeps only one small reference and provider control metadata.
 // Request bodies, manifests, outcomes and completion tokens never enter its
 // history, and delivery schedules one paged Activity for the whole batch.
-func BatchWorkflowV2(ctx workflow.Context, ref model.BatchRef) (model.BatchReport, error) {
+func BatchWorkflow(ctx workflow.Context, ref model.BatchRef) (model.BatchReport, error) {
 	report := model.BatchReport{BatchID: ref.BatchID, Status: "uploading", Requests: ref.Requests, Bytes: ref.Bytes, FailureCounts: map[string]int{}}
 	if err := ref.Config.Validate(); err != nil {
 		return report, failure("INVALID_BATCH", err.Error())
 	}
-	if ref.Requests < 1 || ref.Requests > ref.Config.MaxBatchRequests || ref.Bytes < 1 || ref.Bytes > ref.Config.MaxBatchBytes || ref.BatchID == "" {
+	if ref.Requests < 1 || ref.Requests > ref.Config.MaxBatchRequests || ref.Bytes < 1 || ref.Bytes > ref.Config.MaxBatchBytes || ref.BatchID == "" || ref.DeadlineAt.IsZero() {
 		return report, failure("INVALID_BATCH", "invalid sealed batch reference")
 	}
 	if !ref.FirstAdmittedAt.IsZero() {
@@ -101,13 +92,7 @@ func BatchWorkflowV2(ctx workflow.Context, ref model.BatchRef) (model.BatchRepor
 	if err := workflow.SetQueryHandler(ctx, model.StatusQuery, func() (model.BatchReport, error) { return report, nil }); err != nil {
 		return report, err
 	}
-	recipientDeadline := ref.FirstAdmittedAt.Add(ref.Config.OperationTimeout)
-	if ref.FirstAdmittedAt.IsZero() {
-		recipientDeadline = ref.SealedAt.Add(ref.Config.OperationTimeout)
-	}
-	if !ref.DeadlineAt.IsZero() && ref.DeadlineAt.Before(recipientDeadline) {
-		recipientDeadline = ref.DeadlineAt
-	}
+	recipientDeadline := ref.DeadlineAt
 	save := func() error {
 		return workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, finalizationActivityOptions()), serviceActivities.SaveReport, report).Get(ctx, nil)
 	}

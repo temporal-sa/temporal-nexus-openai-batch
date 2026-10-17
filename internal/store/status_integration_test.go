@@ -38,7 +38,7 @@ func TestPostgresStatusIdentifiesBackingCompletionAndStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Backing != "nexus_standalone_activity" || status.CompletionMode != "external_async_completion_legacy" || status.Storage != "postgres" {
+	if status.Backing != "nexus_standalone_activity" || status.CompletionMode != "external_async_completion" || status.Storage != "postgres" {
 		t.Fatalf("ambiguous runtime metadata: %+v", status)
 	}
 }

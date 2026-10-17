@@ -27,7 +27,7 @@ func TestPostgresLargeBatchHistory(t *testing.T) {
 	cfg.Window = time.Minute
 	cfg.ResultDeadline = 2 * time.Minute
 	cfg.OperationTimeout = 4 * time.Minute
-	runID := h.coordinator(cfg)
+	runID := h.createRun(cfg)
 	const count = 1101
 	runs := make([]client.WorkflowRun, count)
 	requests := make([]model.Request, count)
@@ -85,7 +85,7 @@ func TestNexusEndpointIsolation(t *testing.T) {
 	}
 	owner := newHarness(t, "success", 100*time.Millisecond, false)
 	other := newHarness(t, "success", 100*time.Millisecond, false)
-	owner.coordinator(owner.config())
+	owner.createRun(owner.config())
 	request := owner.request(0)
 	run, err := other.c.ExecuteWorkflow(other.ctx, client.StartWorkflowOptions{ID: "misrouted/" + owner.id, TaskQueue: other.callerQueue}, orchestration.CallerWorkflow, model.CallerInput{Request: request, Config: other.config()})
 	if err != nil {

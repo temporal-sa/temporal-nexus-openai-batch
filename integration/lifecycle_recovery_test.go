@@ -42,7 +42,7 @@ func TestNexusRecoveryBeforeEnrollmentCommit(t *testing.T) {
 	t.Cleanup(func() { close(fault.release) })
 	cfg := h.config()
 	cfg.MaxBatchRequests = 1
-	runID := h.coordinator(cfg)
+	runID := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	var first model.Enrollment
 	select {
@@ -103,7 +103,7 @@ func TestNexusRecoveryRebindsCommittedEnrollment(t *testing.T) {
 	cfg := h.config()
 	cfg.MaxBatchRequests = 1
 	cfg.ResultDeadline, cfg.OperationTimeout = 90*time.Second, 3*time.Minute
-	runID := h.coordinator(cfg)
+	runID := h.createRun(cfg)
 	runs, requests := h.callers(cfg, 1)
 	first := h.waitHandoff()
 	h.awaitJobs(1)

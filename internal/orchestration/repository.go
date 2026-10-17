@@ -80,7 +80,7 @@ func DispatchOnce(ctx context.Context, c client.Client, repo Repository, mode, q
 			ID: model.BatchWorkflowID(ref.BatchID), TaskQueue: queue,
 			WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 			WorkflowExecutionErrorWhenAlreadyStarted: true,
-		}, BatchWorkflowType, ref)
+		}, BatchWorkflow, ref)
 		if err != nil {
 			var exists *serviceerror.WorkflowExecutionAlreadyStarted
 			if !errors.As(err, &exists) {

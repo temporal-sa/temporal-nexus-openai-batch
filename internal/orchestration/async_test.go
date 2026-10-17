@@ -34,7 +34,7 @@ func TestConfigurationLookupFailurePreservesNexusRetryability(t *testing.T) {
 
 func TestIngressEndpointIsolationRejectsMisroutedRun(t *testing.T) {
 	require.NoError(t, validateIngressEndpoint("service-live", "service-live"))
-	require.NoError(t, validateIngressEndpoint("service-live", ""))
+	require.Error(t, validateIngressEndpoint("service-live", ""))
 	err := validateIngressEndpoint("service-live", "service-fake")
 	var handler *nexus.HandlerError
 	require.ErrorAs(t, err, &handler)

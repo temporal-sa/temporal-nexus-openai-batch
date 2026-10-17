@@ -16,8 +16,8 @@ import (
 
 // SubmitRequest is the Nexus-invoked standalone Activity. Durable enrollment
 // owns the exact attempt token before this function releases its worker slot.
-// SDK 1.49 implements the legacy ErrResultPending marker; it does not report the
-// proposed first-class handoff phase or split phase timeouts and retries.
+// ErrResultPending releases the worker slot; durable enrollment keeps the exact
+// attempt alive until its result can be completed externally.
 func (a *ServiceActivities) SubmitRequest(ctx context.Context, input model.SAAInput) (model.Result, error) {
 	if err := model.ValidateRequest(input.Request); err != nil {
 		return model.Result{}, typedFailure(err)

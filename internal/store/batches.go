@@ -191,7 +191,7 @@ func (s *Store) SaveReport(ctx context.Context, report model.BatchReport) error 
 }
 
 func (s *Store) Status(ctx context.Context, runID string) (model.RunStatus, error) {
-	status := model.RunStatus{RunID: runID, Backing: "nexus_standalone_activity", CompletionMode: "external_async_completion_legacy", Storage: "postgres", Batches: []model.BatchReport{}}
+	status := model.RunStatus{RunID: runID, Backing: "nexus_standalone_activity", CompletionMode: "external_async_completion", Storage: "postgres", Batches: []model.BatchReport{}}
 	err := s.pool.QueryRow(ctx, `SELECT admitted,closed FROM nexus_batch_runs WHERE namespace=$1 AND run_id=$2`, s.namespace, runID).Scan(&status.Admitted, &status.Closed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return status, fail("RUN_NOT_STARTED", "batching run does not exist")

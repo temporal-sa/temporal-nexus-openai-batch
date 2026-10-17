@@ -84,6 +84,10 @@ func TestPostgresRecoveryDeadlineAndResources(t *testing.T) {
 	lastDeadline := firstDeadline.Add(-10 * time.Second)
 	first := recoveryEnrollment(namespace, "deadline", "one", firstDeadline)
 	second := recoveryEnrollment(namespace, "deadline", "two", lastDeadline)
+	missingDeadline := first
+	missingDeadline.DeadlineAt = time.Time{}
+	_, err := db.Enroll(ctx, missingDeadline)
+	requireStoreFailure(t, err, "INVALID_INPUT")
 	firstAdmission, err := db.Enroll(ctx, first)
 	if err != nil {
 		t.Fatal(err)

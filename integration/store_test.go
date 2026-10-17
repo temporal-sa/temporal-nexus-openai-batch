@@ -46,7 +46,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	}
 	makeEnrollment := func(run string, i int) model.Enrollment {
 		request := model.Request{RunID: run, RequestID: fmt.Sprintf("request-%04d", i), Input: "private-document-body"}
-		return model.Enrollment{Request: request, Fingerprint: model.Fingerprint(request), Target: model.CompletionTarget{Namespace: namespace,
+		return model.Enrollment{Request: request, Fingerprint: model.Fingerprint(request), DeadlineAt: time.Now().Add(config.OperationTimeout), Target: model.CompletionTarget{Namespace: namespace,
 			ActivityID: fmt.Sprintf("activity/%s/%d", run, i), ActivityRunID: "00000000-0000-4000-8000-000000000000", Attempt: 1, TaskToken: []byte(fmt.Sprintf("private-token-%s-%d", run, i))}}
 	}
 	t.Run("concurrent_atomic_admission_dedupe_and_outbox", func(t *testing.T) {

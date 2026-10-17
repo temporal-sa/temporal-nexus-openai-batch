@@ -3,8 +3,10 @@ export GOCACHE ?= $(CURDIR)/.cache/go-build
 export GOMODCACHE ?= $(CURDIR)/.cache/go-mod
 TEMPORAL_ADDRESS ?= 127.0.0.1:7234
 MODE ?= fake
+PYTHON := python/.venv/bin/python
+PYTHON_DATABASE_URL ?= postgres://nexus_batch:nexus_batch@127.0.0.1:54329/nexus_batch_python?sslmode=disable
 
-.PHONY: build test test-integration test-store runtime postgres postgres-docker postgres-stop migrate server setup worker demo live inspect clean
+.PHONY: build test test-integration test-store runtime postgres postgres-docker postgres-stop init-db server setup worker demo live inspect clean
 build:
 	go build -o bin/batchctl ./cmd/batchctl
 test:
@@ -19,8 +21,8 @@ postgres-stop:
 	bash scripts/postgres-runtime.sh stop
 postgres-docker:
 	docker compose up -d --wait postgres
-migrate: build
-	bin/batchctl migrate
+init-db: build
+	bin/batchctl init-db
 runtime:
 	bash scripts/temporal-runtime.sh --install
 server:
@@ -38,3 +40,25 @@ inspect: build
 	bin/batchctl inspect --run-id $(RUN_ID) --address $(TEMPORAL_ADDRESS)
 clean:
 	@echo 'Run bash scripts/cleanup.sh RUN_ID to cancel only one prototype run; see README.'
+
+.PHONY: python-install python-init python-setup python-worker python-demo python-test python-test-store python-test-workflows python-test-integration
+python-install:
+	uv sync --project python --extra test
+python-init:
+	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m nexus_batch init-db
+python-setup:
+	$(PYTHON) -m nexus_batch setup --mode $(MODE) --address $(TEMPORAL_ADDRESS)
+python-worker:
+	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m nexus_batch worker --mode $(MODE) --address $(TEMPORAL_ADDRESS)
+python-demo:
+	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m nexus_batch demo --mode $(MODE) --address $(TEMPORAL_ADDRESS) --run-id python-$$(date +%s)
+python-test:
+	$(PYTHON) -m pytest -q python/tests
+	$(PYTHON) -m ruff check python
+	$(PYTHON) -m ruff format --check python
+python-test-store:
+	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m pytest -q python/tests/test_store.py
+python-test-workflows:
+	PYTHON_WORKFLOW_TESTS=1 $(PYTHON) -m pytest -q python/tests/test_workflows.py
+python-test-integration:
+	NEXUS_INTEGRATION=1 PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) $(PYTHON) -m pytest -q python/tests/test_integration.py

@@ -19,21 +19,17 @@ import (
 )
 
 const LocalDSN = "postgres://nexus_batch:nexus_batch@127.0.0.1:54329/nexus_batch?sslmode=disable"
-const schemaVersion = 2
 const dispatchLease = 10 * time.Second
 
 //go:embed schema.sql
 var schemaSQL string
-
-//go:embed migration_v2.sql
-var migrationV2SQL string
 
 type Store struct {
 	pool      *pgxpool.Pool
 	namespace string
 }
 
-// Open checks connectivity and applies the versioned schema. Errors deliberately
+// Open checks connectivity and initializes the current schema. Errors deliberately
 // exclude the connection string and underlying parser/connection diagnostics.
 func Open(ctx context.Context, dsn, namespace string) (*Store, error) {
 	if dsn == "" || namespace == "" || len(namespace) > 255 {
@@ -56,7 +52,7 @@ func Open(ctx context.Context, dsn, namespace string) (*Store, error) {
 		return nil, fmt.Errorf("could not connect to PostgreSQL; check DATABASE_URL and database availability")
 	}
 	s := &Store{pool: pool, namespace: namespace}
-	if err := s.Migrate(ctx); err != nil {
+	if err := s.InitializeSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -66,44 +62,21 @@ func Open(ctx context.Context, dsn, namespace string) (*Store, error) {
 func (s *Store) Close()            { s.pool.Close() }
 func (s *Store) Namespace() string { return s.namespace }
 
-func (s *Store) Migrate(ctx context.Context) error {
+// InitializeSchema creates the current preproduction tables and indexes. It is
+// safe for multiple workers to open a fresh database concurrently.
+func (s *Store) InitializeSchema(ctx context.Context) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return dbError("migrate", err)
+		return dbError("initialize schema", err)
 	}
 	defer tx.Rollback(ctx)
-	// One database-wide transaction lock serializes concurrent worker migrations.
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(819482729640031)"); err != nil {
-		return dbError("migrate", err)
+		return dbError("initialize schema", err)
 	}
-	if _, err = tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS nexus_batch_schema_versions(version integer PRIMARY KEY, installed_at timestamptz NOT NULL DEFAULT clock_timestamp())`); err != nil {
-		return dbError("migrate", err)
+	if _, err = tx.Exec(ctx, schemaSQL); err != nil {
+		return dbError("initialize schema", err)
 	}
-	var version int
-	if err = tx.QueryRow(ctx, "SELECT COALESCE(MAX(version),0) FROM nexus_batch_schema_versions").Scan(&version); err != nil {
-		return dbError("migrate", err)
-	}
-	if version > schemaVersion {
-		return fmt.Errorf("PostgreSQL batch schema is newer than this binary")
-	}
-	if version == 0 {
-		if _, err = tx.Exec(ctx, schemaSQL); err != nil {
-			return dbError("migrate", err)
-		}
-		if _, err = tx.Exec(ctx, "INSERT INTO nexus_batch_schema_versions(version) VALUES(1)"); err != nil {
-			return dbError("migrate", err)
-		}
-		version = 1
-	}
-	if version < 2 {
-		if _, err = tx.Exec(ctx, migrationV2SQL); err != nil {
-			return dbError("migrate", err)
-		}
-		if _, err = tx.Exec(ctx, "INSERT INTO nexus_batch_schema_versions(version) VALUES(2)"); err != nil {
-			return dbError("migrate", err)
-		}
-	}
-	return dbError("migrate", tx.Commit(ctx))
+	return dbError("initialize schema", tx.Commit(ctx))
 }
 
 func (s *Store) CreateRun(ctx context.Context, input model.RunInput) error {
@@ -144,8 +117,8 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 	if err := model.ValidateRequest(e.Request); err != nil {
 		return model.Admission{}, err
 	}
-	if e.Fingerprint != model.Fingerprint(e.Request) || !validTarget(e.Target, s.namespace) {
-		return model.Admission{}, fail("INVALID_INPUT", "enrollment fingerprint or completion target is invalid")
+	if e.Fingerprint != model.Fingerprint(e.Request) || !validTarget(e.Target, s.namespace) || e.DeadlineAt.IsZero() {
+		return model.Admission{}, fail("INVALID_INPUT", "enrollment fingerprint, completion target or deadline is invalid")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -214,11 +187,6 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 	}
 	now := time.Now().UTC()
 	deadline := e.DeadlineAt
-	if deadline.IsZero() {
-		// Older callers do not carry the SAA's actual absolute deadline. Preserve
-		// their admission behavior, while runtime callers supply DeadlineAt.
-		deadline = now.Add(cfg.OperationTimeout)
-	}
 	if !now.Before(deadline) {
 		return model.Admission{}, fail("DEADLINE_EXCEEDED", "request completion deadline has passed")
 	}

@@ -16,8 +16,9 @@ func (a *ServiceActivities) Poll(ctx context.Context, job provider.Job, deadline
 	}
 	heartbeatCtx, stop := context.WithCancel(ctx)
 	defer stop()
+	jobID := job.ID
 	if activity.IsActivity(ctx) {
-		activity.RecordHeartbeat(ctx, job.ID)
+		activity.RecordHeartbeat(ctx, jobID)
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
@@ -26,7 +27,7 @@ func (a *ServiceActivities) Poll(ctx context.Context, job provider.Job, deadline
 				case <-heartbeatCtx.Done():
 					return
 				case <-ticker.C:
-					activity.RecordHeartbeat(ctx, job.ID)
+					activity.RecordHeartbeat(ctx, jobID)
 				}
 			}
 		}()
