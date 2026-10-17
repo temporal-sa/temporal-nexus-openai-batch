@@ -19,11 +19,14 @@ import (
 )
 
 const LocalDSN = "postgres://nexus_batch:nexus_batch@127.0.0.1:54329/nexus_batch?sslmode=disable"
-const schemaVersion = 1
+const schemaVersion = 2
 const dispatchLease = 10 * time.Second
 
 //go:embed schema.sql
 var schemaSQL string
+
+//go:embed migration_v2.sql
+var migrationV2SQL string
 
 type Store struct {
 	pool      *pgxpool.Pool
@@ -87,7 +90,16 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if _, err = tx.Exec(ctx, schemaSQL); err != nil {
 			return dbError("migrate", err)
 		}
-		if _, err = tx.Exec(ctx, "INSERT INTO nexus_batch_schema_versions(version) VALUES($1)", schemaVersion); err != nil {
+		if _, err = tx.Exec(ctx, "INSERT INTO nexus_batch_schema_versions(version) VALUES(1)"); err != nil {
+			return dbError("migrate", err)
+		}
+		version = 1
+	}
+	if version < 2 {
+		if _, err = tx.Exec(ctx, migrationV2SQL); err != nil {
+			return dbError("migrate", err)
+		}
+		if _, err = tx.Exec(ctx, "INSERT INTO nexus_batch_schema_versions(version) VALUES(2)"); err != nil {
 			return dbError("migrate", err)
 		}
 	}
@@ -156,8 +168,8 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 		return model.Admission{}, fmt.Errorf("stored run configuration is invalid")
 	}
 	var previousTarget []byte
-	var previousFingerprint, previousBatch string
-	err = tx.QueryRow(ctx, `SELECT target,fingerprint,batch_id FROM nexus_batch_requests WHERE namespace=$1 AND run_id=$2 AND request_id=$3`, s.namespace, e.Request.RunID, e.Request.RequestID).Scan(&previousTarget, &previousFingerprint, &previousBatch)
+	var previousFingerprint, previousBatch, previousDelivery string
+	err = tx.QueryRow(ctx, `SELECT target,fingerprint,batch_id,delivery_status FROM nexus_batch_requests WHERE namespace=$1 AND run_id=$2 AND request_id=$3 FOR UPDATE`, s.namespace, e.Request.RunID, e.Request.RequestID).Scan(&previousTarget, &previousFingerprint, &previousBatch, &previousDelivery)
 	if err == nil {
 		var target model.CompletionTarget
 		if json.Unmarshal(previousTarget, &target) != nil {
@@ -167,6 +179,19 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 			return model.Admission{BatchID: previousBatch, Fingerprint: e.Fingerprint, Config: cfg}, nil
 		}
 		if target.ActivityID == e.Target.ActivityID && target.ActivityRunID == e.Target.ActivityRunID {
+			if previousFingerprint == e.Fingerprint && e.Target.Attempt > target.Attempt && previousDelivery != "delivered" && !stopped {
+				// A retried submission attempt reattaches to its original immutable
+				// membership and result. Only its exact completion target changes.
+				rawTarget, _ := json.Marshal(e.Target)
+				_, err = tx.Exec(ctx, `UPDATE nexus_batch_requests SET target=$4,delivery_status='pending',delivery_diagnostic='',next_heartbeat_at=clock_timestamp() WHERE namespace=$1 AND run_id=$2 AND request_id=$3`, s.namespace, e.Request.RunID, e.Request.RequestID, rawTarget)
+				if err != nil {
+					return model.Admission{}, dbError("reattach enrollment", err)
+				}
+				if err = tx.Commit(ctx); err != nil {
+					return model.Admission{}, dbError("commit reattachment", err)
+				}
+				return model.Admission{BatchID: previousBatch, Fingerprint: e.Fingerprint, Config: cfg}, nil
+			}
 			return model.Admission{}, fail("STALE_ACTIVITY_ATTEMPT", "request is already fenced to a different Activity attempt")
 		}
 		return model.Admission{}, fail("DUPLICATE_REQUEST", "request_id is already owned by another operation")
@@ -188,6 +213,15 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 		return model.Admission{}, fail("INVALID_INPUT", "request exceeds configured batch byte limit")
 	}
 	now := time.Now().UTC()
+	deadline := e.DeadlineAt
+	if deadline.IsZero() {
+		// Older callers do not carry the SAA's actual absolute deadline. Preserve
+		// their admission behavior, while runtime callers supply DeadlineAt.
+		deadline = now.Add(cfg.OperationTimeout)
+	}
+	if !now.Before(deadline) {
+		return model.Admission{}, fail("DEADLINE_EXCEEDED", "request completion deadline has passed")
+	}
 	batchID := ""
 	count, byteCount := 0, 0
 	if openBatch != nil {
@@ -208,7 +242,7 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 	}
 	if batchID == "" {
 		batchID = fmt.Sprintf("%s-%08d", e.Request.RunID, sequence)
-		_, err = tx.Exec(ctx, `INSERT INTO nexus_batch_batches(namespace,batch_id,run_id,mode,endpoint,first_admitted_at,seal_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, s.namespace, batchID, e.Request.RunID, cfg.Mode, cfg.Endpoint, now, now.Add(cfg.Window))
+		_, err = tx.Exec(ctx, `INSERT INTO nexus_batch_batches(namespace,batch_id,run_id,mode,endpoint,first_admitted_at,seal_at,deadline_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, s.namespace, batchID, e.Request.RunID, cfg.Mode, cfg.Endpoint, now, now.Add(cfg.Window), deadline)
 		if err != nil {
 			return model.Admission{}, dbError("create batch", err)
 		}
@@ -218,7 +252,7 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 	}
 	rawRequest, _ := json.Marshal(e.Request)
 	rawTarget, _ := json.Marshal(e.Target)
-	_, err = tx.Exec(ctx, `INSERT INTO nexus_batch_requests(namespace,run_id,request_id,batch_id,request,target,activity_id,activity_run_id,fingerprint,admitted_at,position) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, s.namespace, e.Request.RunID, e.Request.RequestID, batchID, rawRequest, rawTarget, e.Target.ActivityID, e.Target.ActivityRunID, e.Fingerprint, now, count)
+	_, err = tx.Exec(ctx, `INSERT INTO nexus_batch_requests(namespace,run_id,request_id,batch_id,request,target,activity_id,activity_run_id,fingerprint,admitted_at,position,deadline_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, s.namespace, e.Request.RunID, e.Request.RequestID, batchID, rawRequest, rawTarget, e.Target.ActivityID, e.Target.ActivityRunID, e.Fingerprint, now, count, deadline)
 	if uniqueViolation(err) {
 		return model.Admission{}, fail("DUPLICATE_REQUEST", "completion target is already owned by another request")
 	}
@@ -227,7 +261,7 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 	}
 	count++
 	byteCount += len(line)
-	if _, err = tx.Exec(ctx, `UPDATE nexus_batch_batches SET requests=$3,bytes=$4 WHERE namespace=$1 AND batch_id=$2`, s.namespace, batchID, count, byteCount); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE nexus_batch_batches SET requests=$3,bytes=$4,deadline_at=LEAST(deadline_at,$5) WHERE namespace=$1 AND batch_id=$2`, s.namespace, batchID, count, byteCount, deadline); err != nil {
 		return model.Admission{}, dbError("size batch", err)
 	}
 	if _, err = tx.Exec(ctx, `UPDATE nexus_batch_runs SET admitted=admitted+1 WHERE namespace=$1 AND run_id=$2`, s.namespace, e.Request.RunID); err != nil {

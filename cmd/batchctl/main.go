@@ -159,8 +159,13 @@ func runWorker(args []string) error {
 	state := f.String("state-dir", ".state/fake", "persistent fake-provider state directory")
 	scenario := f.String("scenario", "success", "fake scenario: success, mixed, expired, missing, duplicate, unknown, malformed, submission-unknown, submission-unreconciled")
 	delay := f.Duration("delay", 2*time.Second, "fake processing duration")
+	serviceSlots := f.Int("service-concurrency", 32, "maximum concurrent enrollment Activities")
+	batchSlots := f.Int("batch-concurrency", 32, "maximum concurrent batch Activities; size for batch memory and provider capacity")
 	if err := f.Parse(args); err != nil {
 		return err
+	}
+	if *serviceSlots < 1 || *batchSlots < 1 {
+		return fmt.Errorf("worker concurrency must be positive")
 	}
 	var p provider.Provider
 	var err error
@@ -189,14 +194,21 @@ func runWorker(args []string) error {
 		return err
 	}
 	defer c.Close()
-	sw := worker.New(c, serviceQueue(*mode), worker.Options{})
+	sw := worker.New(c, serviceQueue(*mode), worker.Options{MaxConcurrentActivityExecutionSize: *serviceSlots, WorkerStopTimeout: 5 * time.Second})
 	orchestration.RegisterService(sw, c, p, db)
+	batchQueue := serviceQueue(*mode) + "-batches-v2"
+	bw := worker.New(c, batchQueue, worker.Options{MaxConcurrentActivityExecutionSize: *batchSlots, WorkerStopTimeout: 5 * time.Second})
+	orchestration.RegisterBatch(bw, c, p, db)
 	cw := worker.New(c, model.CallerTaskQueue, worker.Options{})
 	orchestration.RegisterCaller(cw)
 	if err = sw.Start(); err != nil {
 		return err
 	}
 	defer sw.Stop()
+	if err = bw.Start(); err != nil {
+		return err
+	}
+	defer bw.Stop()
 	if err = cw.Start(); err != nil {
 		return err
 	}
@@ -204,7 +216,7 @@ func runWorker(args []string) error {
 	fmt.Fprintf(os.Stderr, "Workers ready: mode=%s service_queue=%s endpoint=%s store=postgres\n", *mode, serviceQueue(*mode), endpoint(*mode))
 	dispatchErr := make(chan error, 1)
 	go func() {
-		dispatchErr <- orchestration.Dispatcher(ctx, c, db, *mode, serviceQueue(*mode), endpoint(*mode))
+		dispatchErr <- orchestration.Dispatcher(ctx, c, db, *mode, batchQueue, endpoint(*mode))
 	}()
 	defer stop()
 	select {
@@ -472,8 +484,10 @@ func control(command string, args []string) error {
 	if err := model.ValidateRequest(model.Request{RunID: *id, RequestID: "validate", Input: "validate"}); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	var trackedBatches []string
+	var trackedTargets []model.CompletionTarget
 	if command == "inspect" || command == "finish" || command == "cleanup" {
 		db, err := openStore(ctx, conn.namespace)
 		if err != nil {
@@ -497,6 +511,11 @@ func control(command string, args []string) error {
 			if !errors.As(err, &failure) || failure.Code != "RUN_NOT_STARTED" {
 				return err
 			}
+		} else {
+			trackedBatches, trackedTargets, err = db.RunResources(ctx, *id)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	c, err := conn.dial()
@@ -506,7 +525,7 @@ func control(command string, args []string) error {
 	defer c.Close()
 	switch command {
 	case "cleanup":
-		return cleanup(ctx, c, *id)
+		return cleanup(ctx, c, *id, trackedBatches, trackedTargets)
 	case "cancel":
 		if *rid == "" {
 			return fmt.Errorf("--request-id is required")
@@ -537,19 +556,27 @@ func ownedWorkflow(id, runID string) bool {
 	}
 	return true
 }
-func cleanup(ctx context.Context, c client.Client, runID string) error {
+func cleanup(ctx context.Context, c client.Client, runID string, trackedBatches []string, trackedTargets []model.CompletionTarget) error {
 	q := fmt.Sprintf("ExecutionStatus = 'Running' AND (WorkflowId = 'batch-coordinator/%s' OR WorkflowId STARTS_WITH 'caller/%s/' OR WorkflowId STARTS_WITH 'batch-request/%s/' OR WorkflowId STARTS_WITH 'batch/%s-')", runID, runID, runID, runID)
 	var ids []string
+	seenIDs := map[string]bool{}
+	for _, batchID := range trackedBatches {
+		id := model.BatchWorkflowID(batchID)
+		ids = append(ids, id)
+		seenIDs[id] = true
+	}
 	var cleanupErrors []error
 	var token []byte
 	for {
 		page, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: q, PageSize: 1000, NextPageToken: token})
 		if err != nil {
-			return err
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("supplemental workflow visibility: %w", err))
+			break
 		}
 		for _, e := range page.Executions {
-			if ownedWorkflow(e.Execution.WorkflowId, runID) {
+			if ownedWorkflow(e.Execution.WorkflowId, runID) && !seenIDs[e.Execution.WorkflowId] {
 				ids = append(ids, e.Execution.WorkflowId)
+				seenIDs[e.Execution.WorkflowId] = true
 			}
 		}
 		if len(page.NextPageToken) == 0 {
@@ -565,31 +592,44 @@ func cleanup(ctx context.Context, c client.Client, runID string) error {
 			}
 		}
 	}
+	var terminated []string
+	seenTargets := map[string]bool{}
+	terminate := func(target model.CompletionTarget) {
+		key := target.ActivityID + "/" + target.ActivityRunID
+		if seenTargets[key] {
+			return
+		}
+		seenTargets[key] = true
+		h := c.GetActivityHandle(client.GetActivityHandleOptions{ActivityID: target.ActivityID, RunID: target.ActivityRunID})
+		if err := h.Terminate(ctx, client.TerminateActivityOptions{Reason: "explicit prototype run cleanup"}); err != nil {
+			var missing *serviceerror.NotFound
+			if !errors.As(err, &missing) {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("terminate %s: %w", target.ActivityID, err))
+			}
+			return
+		}
+		terminated = append(terminated, target.ActivityID)
+	}
+	for _, target := range trackedTargets {
+		terminate(target)
+	}
 	activities, err := c.ListActivities(ctx, client.ListActivitiesOptions{Query: fmt.Sprintf("ActivityId STARTS_WITH 'request-activity/%s/'", runID)})
 	if err != nil {
-		return err
-	}
-	var terminated []string
-	for info, e := range activities.Results {
-		if e != nil {
-			cleanupErrors = append(cleanupErrors, e)
-			break
-		}
-		if !strings.HasPrefix(info.ActivityID, "request-activity/"+runID+"/") {
-			continue
-		}
-		if info.Status != enums.ACTIVITY_EXECUTION_STATUS_RUNNING && info.Status != enums.ACTIVITY_EXECUTION_STATUS_PAUSED {
-			continue
-		}
-		h := c.GetActivityHandle(client.GetActivityHandleOptions{ActivityID: info.ActivityID, RunID: info.ActivityRunID})
-		if e = h.Terminate(ctx, client.TerminateActivityOptions{Reason: "explicit prototype run cleanup"}); e != nil {
-			var missing *serviceerror.NotFound
-			if !errors.As(e, &missing) {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("terminate %s: %w", info.ActivityID, e))
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("supplemental activity visibility: %w", err))
+	} else {
+		for info, e := range activities.Results {
+			if e != nil {
+				cleanupErrors = append(cleanupErrors, e)
+				break
 			}
-			continue
+			if !strings.HasPrefix(info.ActivityID, "request-activity/"+runID+"/") {
+				continue
+			}
+			if info.Status != enums.ACTIVITY_EXECUTION_STATUS_RUNNING && info.Status != enums.ACTIVITY_EXECUTION_STATUS_PAUSED {
+				continue
+			}
+			terminate(model.CompletionTarget{ActivityID: info.ActivityID, ActivityRunID: info.ActivityRunID})
 		}
-		terminated = append(terminated, info.ActivityID)
 	}
 	if err = printJSON(map[string]any{"run_id": runID, "cancellation_requested": ids, "standalone_activities_terminated": terminated, "note": "Cleanup closes only this run's Temporal resources. Upstream OpenAI jobs and uploaded files are retained; shared provider jobs are never canceled automatically."}); err != nil {
 		cleanupErrors = append(cleanupErrors, err)

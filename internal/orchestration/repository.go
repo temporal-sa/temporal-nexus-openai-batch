@@ -3,6 +3,7 @@ package orchestration
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/model"
@@ -20,11 +21,14 @@ type Repository interface {
 	SealDue(context.Context, string, string, int) (int, error)
 	ReadyBatches(context.Context, string, string, int) ([]model.BatchRef, error)
 	MarkDispatched(context.Context, string) error
+	HeartbeatTargets(context.Context, string, string, int) ([]model.CompletionTarget, error)
+	PendingCompletions(context.Context, string, string, int) ([]model.BatchDelivery, error)
+	WithSubmission(context.Context, string, func(context.Context) error) error
 	LoadManifest(context.Context, string) (model.Manifest, error)
 	SaveOutcomes(context.Context, string, []model.Outcome, []string) error
 	FailBatch(context.Context, string, string, string) error
 	PendingDeliveries(context.Context, string, int) ([]model.StoredDelivery, error)
-	MarkDelivered(context.Context, string, string, bool, string) error
+	MarkDelivered(context.Context, string, string, model.CompletionTarget, bool, string) error
 	DeliverySummary(context.Context, string) (model.DeliverySummary, error)
 	SaveReport(context.Context, model.BatchReport) error
 }
@@ -32,6 +36,9 @@ type Repository interface {
 // Dispatcher drains the database outbox. A crash between the Temporal start
 // and MarkDispatched is safe: the stable Workflow ID rejects another execution.
 func Dispatcher(ctx context.Context, c client.Client, repo Repository, mode, queue, endpoint string) error {
+	keeperCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go maintainEnrollments(keeperCtx, c, repo, mode, endpoint)
 	backoff := 100 * time.Millisecond
 	for {
 		if ctx.Err() != nil {
@@ -73,7 +80,7 @@ func DispatchOnce(ctx context.Context, c client.Client, repo Repository, mode, q
 			ID: model.BatchWorkflowID(ref.BatchID), TaskQueue: queue,
 			WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 			WorkflowExecutionErrorWhenAlreadyStarted: true,
-		}, BatchWorkflow, ref)
+		}, BatchWorkflowType, ref)
 		if err != nil {
 			var exists *serviceerror.WorkflowExecutionAlreadyStarted
 			if !errors.As(err, &exists) {
@@ -109,9 +116,69 @@ func (a *ServiceActivities) Deliver(ctx context.Context, ref model.BatchRef) (mo
 			if err != nil {
 				return model.DeliverySummary{}, err
 			}
-			if err := a.Store.MarkDelivered(ctx, ref.BatchID, row.RequestID, delivery.Delivered, delivery.Diagnostic); err != nil {
+			if err := a.Store.MarkDelivered(ctx, ref.BatchID, row.RequestID, row.Target, delivery.Delivered, delivery.Diagnostic); err != nil {
 				return model.DeliverySummary{}, err
 			}
+		}
+	}
+}
+
+// Pending SAAs heartbeat through durable Postgres ownership after releasing their
+// worker slot. Before enrollment exists, a lost worker is recovered by the SAA's
+// heartbeat timeout and retry policy. Each retry rebinds only its own execution.
+func maintainEnrollments(ctx context.Context, c client.Client, repo Repository, mode, endpoint string) {
+	for ctx.Err() == nil {
+		rows, err := repo.HeartbeatTargets(ctx, mode, endpoint, 100)
+		if err == nil {
+			var group sync.WaitGroup
+			for _, target := range rows {
+				group.Add(1)
+				go func(target model.CompletionTarget) {
+					defer group.Done()
+					callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					defer cancel()
+					// A stale token cannot heartbeat a newer attempt. The next
+					// successful Enroll replaces it transactionally.
+					_ = c.RecordActivityHeartbeat(callCtx, target.TaskToken)
+				}(target)
+			}
+			group.Wait()
+		}
+		// Delivery is also an outbox operation: a newly rebound attempt must
+		// receive an already-stored result even if its Batch Workflow closed.
+		pending, deliveryErr := repo.PendingCompletions(ctx, mode, endpoint, 100)
+		if deliveryErr == nil {
+			var group sync.WaitGroup
+			for _, row := range pending {
+				group.Add(1)
+				go func(row model.BatchDelivery) {
+					defer group.Done()
+					callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					defer cancel()
+					a := ServiceActivities{Client: c, Store: repo}
+					result, err := a.CompleteResult(callCtx, row.Target, row.Outcome)
+					if err == nil {
+						_ = repo.MarkDelivered(callCtx, row.BatchID, row.RequestID, row.Target, result.Delivered, result.Diagnostic)
+					}
+				}(row)
+			}
+			group.Wait()
+		}
+		wait := 100 * time.Millisecond
+		// Drain full pages immediately; a fixed delay per page would cap
+		// keepalive throughput regardless of available server capacity.
+		if len(rows) == 100 || len(pending) == 100 {
+			wait = 0
+		}
+		if err != nil {
+			wait = time.Second
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 }

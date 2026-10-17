@@ -122,7 +122,7 @@ func (s *Store) PendingDeliveries(ctx context.Context, batchID string, limit int
 	return deliveries, dbError("read delivery", rows.Err())
 }
 
-func (s *Store) MarkDelivered(ctx context.Context, batchID, requestID string, delivered bool, diagnostic string) error {
+func (s *Store) MarkDelivered(ctx context.Context, batchID, requestID string, expected model.CompletionTarget, delivered bool, diagnostic string) error {
 	status := "skipped"
 	if delivered {
 		status = "delivered"
@@ -132,12 +132,24 @@ func (s *Store) MarkDelivered(ctx context.Context, batchID, requestID string, de
 	}
 	// Terminal progress is monotonic and retry-idempotent, including after a lost
 	// completion acknowledgment has been reconciled by the delivery Activity.
-	tag, err := s.pool.Exec(ctx, `UPDATE nexus_batch_requests SET delivery_status=CASE WHEN delivery_status='pending' THEN $4 ELSE delivery_status END,delivery_diagnostic=CASE WHEN delivery_status='pending' THEN $5 ELSE delivery_diagnostic END WHERE namespace=$1 AND batch_id=$2 AND request_id=$3 AND outcome IS NOT NULL`, s.namespace, batchID, requestID, status, diagnostic)
+	rawTarget, err := json.Marshal(expected)
+	if err != nil {
+		return fail("INVALID_ACTIVITY_TARGET", "completion target cannot be serialized")
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE nexus_batch_requests SET delivery_status=CASE WHEN delivery_status='pending' THEN $4 ELSE delivery_status END,delivery_diagnostic=CASE WHEN delivery_status='pending' THEN $5 ELSE delivery_diagnostic END WHERE namespace=$1 AND batch_id=$2 AND request_id=$3 AND outcome IS NOT NULL AND target=$6::jsonb`, s.namespace, batchID, requestID, status, diagnostic, rawTarget)
 	if err != nil {
 		return dbError("mark delivery", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fail("DELIVERY_NOT_FOUND", "stored outcome does not exist")
+		// A concurrently retried SAA may have reattached its newer exact target.
+		// The old delivery must not mark that recipient skipped or completed.
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nexus_batch_requests WHERE namespace=$1 AND batch_id=$2 AND request_id=$3 AND outcome IS NOT NULL)`, s.namespace, batchID, requestID).Scan(&exists); err != nil {
+			return dbError("check delivery", err)
+		}
+		if !exists {
+			return fail("DELIVERY_NOT_FOUND", "stored outcome does not exist")
+		}
 	}
 	return nil
 }

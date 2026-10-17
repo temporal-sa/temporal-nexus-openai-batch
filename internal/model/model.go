@@ -21,6 +21,7 @@ const (
 	HardMaxBatchRequests = 50_000
 	HardMaxBatchBytes    = 200_000_000
 	DefaultBatchBytes    = 512 * 1024
+	EnrollmentHeartbeat  = 30 * time.Second
 )
 
 type Request struct {
@@ -121,6 +122,7 @@ type Enrollment struct {
 	Request     Request          `json:"request"`
 	Target      CompletionTarget `json:"completion_target"`
 	Fingerprint string           `json:"fingerprint"`
+	DeadlineAt  time.Time        `json:"deadline_at,omitempty"`
 }
 
 // CompletionTarget fences external completion to the exact standalone Activity
@@ -170,6 +172,7 @@ type BatchRef struct {
 	Bytes           int       `json:"bytes"`
 	SealedAt        time.Time `json:"sealed_at"`
 	FirstAdmittedAt time.Time `json:"first_admitted_at"`
+	DeadlineAt      time.Time `json:"deadline_at,omitempty"`
 }
 
 // StoredDelivery is loaded and consumed within an Activity, never a Workflow.
@@ -177,6 +180,12 @@ type StoredDelivery struct {
 	RequestID string           `json:"request_id"`
 	Target    CompletionTarget `json:"completion_target"`
 	Outcome   Outcome          `json:"outcome"`
+}
+
+// BatchDelivery is consumed by the completion keeper outside Workflow history.
+type BatchDelivery struct {
+	BatchID string `json:"batch_id"`
+	StoredDelivery
 }
 
 type DeliverySummary struct {

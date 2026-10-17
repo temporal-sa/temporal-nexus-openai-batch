@@ -71,7 +71,7 @@ func (s *Store) ReadyBatches(ctx context.Context, mode, endpoint string, limit i
 		return nil, dbError("claim dispatch", err)
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT b.run_id,b.batch_id,r.config,b.requests,b.bytes,b.sealed_at,b.first_admitted_at FROM nexus_batch_batches b JOIN nexus_batch_runs r ON r.namespace=b.namespace AND r.run_id=b.run_id WHERE b.namespace=$1 AND b.mode=$2 AND b.endpoint=$3 AND b.state='sealed' AND NOT b.dispatched AND NOT r.stopped AND (b.dispatch_claim_until IS NULL OR b.dispatch_claim_until<clock_timestamp()) ORDER BY b.sealed_at,b.batch_id LIMIT $4 FOR UPDATE OF b SKIP LOCKED`, s.namespace, mode, endpoint, boundedLimit(limit))
+	rows, err := tx.Query(ctx, `SELECT b.run_id,b.batch_id,r.config,b.requests,b.bytes,b.sealed_at,b.first_admitted_at,b.deadline_at FROM nexus_batch_batches b JOIN nexus_batch_runs r ON r.namespace=b.namespace AND r.run_id=b.run_id WHERE b.namespace=$1 AND b.mode=$2 AND b.endpoint=$3 AND b.state='sealed' AND NOT b.dispatched AND NOT r.stopped AND (b.dispatch_claim_until IS NULL OR b.dispatch_claim_until<clock_timestamp()) ORDER BY b.sealed_at,b.batch_id LIMIT $4 FOR UPDATE OF b SKIP LOCKED`, s.namespace, mode, endpoint, boundedLimit(limit))
 	if err != nil {
 		return nil, dbError("select dispatch", err)
 	}
@@ -80,7 +80,7 @@ func (s *Store) ReadyBatches(ctx context.Context, mode, endpoint string, limit i
 	for rows.Next() {
 		var ref model.BatchRef
 		var raw []byte
-		if err = rows.Scan(&ref.RunID, &ref.BatchID, &raw, &ref.Requests, &ref.Bytes, &ref.SealedAt, &ref.FirstAdmittedAt); err != nil {
+		if err = rows.Scan(&ref.RunID, &ref.BatchID, &raw, &ref.Requests, &ref.Bytes, &ref.SealedAt, &ref.FirstAdmittedAt, &ref.DeadlineAt); err != nil {
 			rows.Close()
 			return nil, dbError("read dispatch", err)
 		}
@@ -199,7 +199,12 @@ func (s *Store) Status(ctx context.Context, runID string) (model.RunStatus, erro
 	if err != nil {
 		return status, dbError("run status", err)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT batch_id,state,requests,bytes,report,dispatched,first_admitted_at,sealed_at FROM nexus_batch_batches WHERE namespace=$1 AND run_id=$2 ORDER BY batch_id`, s.namespace, runID)
+	rows, err := s.pool.Query(ctx, `SELECT b.batch_id,b.state,b.requests,b.bytes,b.report,b.dispatched,b.first_admitted_at,b.sealed_at,COALESCE(d.delivered,0),COALESCE(d.skipped,0)
+		FROM nexus_batch_batches b LEFT JOIN (
+			SELECT batch_id,COUNT(*) FILTER (WHERE delivery_status='delivered') AS delivered,COUNT(*) FILTER (WHERE delivery_status='skipped') AS skipped
+			FROM nexus_batch_requests WHERE namespace=$1 AND run_id=$2 GROUP BY batch_id
+		) d ON d.batch_id=b.batch_id
+		WHERE b.namespace=$1 AND b.run_id=$2 ORDER BY b.batch_id`, s.namespace, runID)
 	if err != nil {
 		return status, dbError("batch status", err)
 	}
@@ -211,7 +216,8 @@ func (s *Store) Status(ctx context.Context, runID string) (model.RunStatus, erro
 		var dispatched bool
 		var first time.Time
 		var sealed *time.Time
-		if err = rows.Scan(&report.BatchID, &state, &report.Requests, &report.Bytes, &raw, &dispatched, &first, &sealed); err != nil {
+		var delivered, skipped int
+		if err = rows.Scan(&report.BatchID, &state, &report.Requests, &report.Bytes, &raw, &dispatched, &first, &sealed, &delivered, &skipped); err != nil {
 			return status, dbError("read status", err)
 		}
 		if state == "open" {
@@ -231,6 +237,9 @@ func (s *Store) Status(ctx context.Context, runID string) (model.RunStatus, erro
 				report.CollectionWait = sealed.Sub(first)
 			}
 		}
+		// The independent completion keeper can advance checkpoints after the
+		// Workflow saved its final report. The request rows own delivery counts.
+		report.Delivered, report.Skipped = delivered, skipped
 		status.Batches = append(status.Batches, report)
 	}
 	return status, dbError("read status", rows.Err())

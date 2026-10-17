@@ -44,7 +44,7 @@ func TestBatchWorkflowHistoryCommandsDoNotScaleWithRequests(t *testing.T) {
 			summary := model.DeliverySummary{Succeeded: count, Delivered: count}
 			env.OnActivity(serviceActivities.Results, mock.Anything, ref, job).Return(summary, nil).Once()
 			env.OnActivity(serviceActivities.Deliver, mock.Anything, ref).Return(summary, nil).Once()
-			env.ExecuteWorkflow(BatchWorkflow, ref)
+			env.ExecuteWorkflow(BatchWorkflowV2, ref)
 			require.NoError(t, env.GetWorkflowError())
 			var report model.BatchReport
 			require.NoError(t, env.GetWorkflowResult(&report))
@@ -66,7 +66,7 @@ func TestBatchAmbiguousCreateReconcilesWithoutResubmission(t *testing.T) {
 	summary := model.DeliverySummary{Succeeded: 2, Delivered: 2}
 	env.OnActivity(serviceActivities.Results, mock.Anything, ref, job).Return(summary, nil).Once()
 	env.OnActivity(serviceActivities.Deliver, mock.Anything, ref).Return(summary, nil).Once()
-	env.ExecuteWorkflow(BatchWorkflow, ref)
+	env.ExecuteWorkflow(BatchWorkflowV2, ref)
 	require.NoError(t, env.GetWorkflowError())
 	env.AssertExpectations(t)
 }
@@ -83,7 +83,7 @@ func TestProviderCompletionDoesNotPublishTerminalLifecycleBeforeDelivery(t *test
 	env.OnActivity(serviceActivities.Create, mock.Anything, ref, "file-1").Return(CreateResult{Job: job}, nil).Once()
 	env.OnActivity(serviceActivities.Results, mock.Anything, ref, job).Return(model.DeliverySummary{Succeeded: 2}, nil).Once()
 	env.OnActivity(serviceActivities.Deliver, mock.Anything, ref).Return(model.DeliverySummary{Succeeded: 2, Delivered: 2}, nil).Once()
-	env.ExecuteWorkflow(BatchWorkflow, ref)
+	env.ExecuteWorkflow(BatchWorkflowV2, ref)
 	require.NoError(t, env.GetWorkflowError())
 	foundProviderCompletion := false
 	for index, report := range reports {
@@ -108,7 +108,7 @@ func TestBatchUnresolvedSubmissionPersistsFailuresBeforeDelivery(t *testing.T) {
 	summary := model.DeliverySummary{Failed: 2, Delivered: 2, FailureCounts: map[string]int{"SUBMISSION_UNKNOWN": 2}}
 	env.OnActivity(serviceActivities.FailBatch, mock.Anything, ref, "SUBMISSION_UNKNOWN", mock.Anything).Return(summary, nil).Once()
 	env.OnActivity(serviceActivities.Deliver, mock.Anything, ref).Return(summary, nil).Once()
-	env.ExecuteWorkflow(BatchWorkflow, ref)
+	env.ExecuteWorkflow(BatchWorkflowV2, ref)
 	require.NoError(t, env.GetWorkflowError())
 	var report model.BatchReport
 	require.NoError(t, env.GetWorkflowResult(&report))
@@ -121,14 +121,16 @@ func TestBatchDeadlinePersistsOneAggregateFailure(t *testing.T) {
 	ref.Config.Window = 500 * time.Millisecond
 	ref.Config.ResultDeadline = 2 * time.Second
 	ref.Config.PollInterval = time.Second
+	ref.FirstAdmittedAt = ref.SealedAt
 	job := provider.Job{ID: "provider-1", Status: "in_progress", InputFileID: "file-1"}
 	env.OnActivity(serviceActivities.Upload, mock.Anything, ref).Return("file-1", nil).Once()
 	env.OnActivity(serviceActivities.Create, mock.Anything, ref, "file-1").Return(CreateResult{Job: job}, nil).Once()
-	env.OnActivity(serviceActivities.Retrieve, mock.Anything, "provider-1").Return(job, nil).Once()
+	env.OnActivity(serviceActivities.Poll, mock.Anything, job, env.Now().Add(2*time.Second), time.Second).
+		Return(provider.Job{}, failure("DEADLINE_EXCEEDED", "provider result deadline reached")).After(2 * time.Second).Once()
 	summary := model.DeliverySummary{Failed: ref.Requests, Delivered: ref.Requests, FailureCounts: map[string]int{"DEADLINE_EXCEEDED": ref.Requests}}
 	env.OnActivity(serviceActivities.FailBatch, mock.Anything, ref, "DEADLINE_EXCEEDED", mock.Anything).Return(summary, nil).Once()
 	env.OnActivity(serviceActivities.Deliver, mock.Anything, ref).Return(summary, nil).Once()
-	env.ExecuteWorkflow(BatchWorkflow, ref)
+	env.ExecuteWorkflow(BatchWorkflowV2, ref)
 	require.NoError(t, env.GetWorkflowError())
 	var report model.BatchReport
 	require.NoError(t, env.GetWorkflowResult(&report))
@@ -150,7 +152,7 @@ func TestBatchControlPersistenceSurvivesMoreThanFiveTransientFailures(t *testing
 	summary := model.DeliverySummary{Succeeded: 1, Delivered: 1}
 	env.OnActivity(serviceActivities.Results, mock.Anything, ref, job).Return(summary, nil).Once()
 	env.OnActivity(serviceActivities.Deliver, mock.Anything, ref).Return(summary, nil).Once()
-	env.ExecuteWorkflow(BatchWorkflow, ref)
+	env.ExecuteWorkflow(BatchWorkflowV2, ref)
 	require.NoError(t, env.GetWorkflowError())
 	env.AssertExpectations(t)
 }
@@ -210,6 +212,12 @@ func (r *transientDispatcherRepository) SealDue(context.Context, string, string,
 }
 func (r *transientDispatcherRepository) ReadyBatches(context.Context, string, string, int) ([]model.BatchRef, error) {
 	r.cancel()
+	return nil, nil
+}
+func (r *transientDispatcherRepository) HeartbeatTargets(context.Context, string, string, int) ([]model.CompletionTarget, error) {
+	return nil, nil
+}
+func (r *transientDispatcherRepository) PendingCompletions(context.Context, string, string, int) ([]model.BatchDelivery, error) {
 	return nil, nil
 }
 func TestDispatcherKeepsWorkersAliveThroughTemporaryStorageOutage(t *testing.T) {

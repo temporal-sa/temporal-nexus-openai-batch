@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"time"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/model"
@@ -27,15 +28,22 @@ func RequestActivityID(r model.Request, nexusRequestID string) string {
 	return "request-activity/" + r.RunID + "/" + hex.EncodeToString(h[:])
 }
 
-func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo Repository) {
-	w.RegisterWorkflow(BatchWorkflow)
+const BatchWorkflowType = "BatchWorkflowV2"
+
+func RegisterBatch(w worker.Worker, c client.Client, p provider.Provider, repo Repository) {
+	w.RegisterWorkflowWithOptions(BatchWorkflowLegacy, workflow.RegisterOptions{Name: "BatchWorkflow"})
+	w.RegisterWorkflowWithOptions(BatchWorkflowV2, workflow.RegisterOptions{Name: BatchWorkflowType})
 	activities := &ServiceActivities{Client: c, Provider: p, Store: repo}
 	// Enrollment and exact-token completion are plain helpers inside these
 	// Activities. They are not registered as per-request Workflow Activities.
 	for _, implementation := range []any{activities.SubmitRequest, activities.Upload, activities.Create, activities.Find,
-		activities.Retrieve, activities.Results, activities.FailBatch, activities.SaveReport, activities.Deliver} {
+		activities.Retrieve, activities.Poll, activities.Results, activities.FailBatch, activities.SaveReport, activities.Deliver} {
 		w.RegisterActivity(implementation)
 	}
+}
+
+func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo Repository) {
+	RegisterBatch(w, c, p, repo)
 	op := temporalnexus.MustNewTemporalOperation(temporalnexus.TemporalOperationOptions[model.Request, model.Result]{
 		Name: model.Operation,
 		Start: func(ctx context.Context, nc temporalnexus.NexusClient, input model.Request, opts temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[model.Result], error) {
@@ -58,7 +66,8 @@ func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo
 				ID:                     activityID,
 				StartToCloseTimeout:    config.OperationTimeout,
 				ScheduleToCloseTimeout: config.OperationTimeout,
-				RetryPolicy:            &temporal.RetryPolicy{MaximumAttempts: 1},
+				HeartbeatTimeout:       model.EnrollmentHeartbeat,
+				RetryPolicy:            &temporal.RetryPolicy{InitialInterval: time.Second, MaximumInterval: 10 * time.Second},
 				ActivityIDReusePolicy:  enums.ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE,
 			}, serviceActivities.SubmitRequest, model.SAAInput{Request: input, Config: config})
 			if err == nil {
@@ -176,19 +185,37 @@ func (a *ServiceActivities) Upload(ctx context.Context, ref model.BatchRef) (str
 }
 
 type CreateResult struct {
-	Job       provider.Job
-	Failure   string
-	Ambiguous bool
+	Job         provider.Job
+	Failure     string
+	FailureCode string
+	Ambiguous   bool
 }
 
 // Create's Activity has one attempt and the provider makes one HTTP attempt.
 // An Activity transport failure is also ambiguous and is reconciled by Find.
 func (a *ServiceActivities) Create(ctx context.Context, ref model.BatchRef, fileID string) (CreateResult, error) {
-	job, err := a.Provider.Create(ctx, fileID, batchMetadata(ref))
+	var result CreateResult
+	called := false
+	err := a.Store.WithSubmission(ctx, ref.BatchID, func(callCtx context.Context) error {
+		called = true
+		job, providerErr := a.Provider.Create(callCtx, fileID, batchMetadata(ref))
+		if providerErr != nil {
+			result = CreateResult{Failure: providerErr.Error(), Ambiguous: provider.IsAmbiguous(providerErr)}
+		} else {
+			result.Job = controlJob(job)
+		}
+		return nil
+	})
 	if err != nil {
-		return CreateResult{Failure: err.Error(), Ambiguous: provider.IsAmbiguous(err)}, nil
+		var known *model.Failure
+		if !called && errors.As(err, &known) {
+			return CreateResult{Failure: known.Message, FailureCode: known.Code}, nil
+		}
+		// A gate acknowledgment may be lost after the provider accepted work.
+		// Preserve the one-attempt rule and reconcile instead of creating again.
+		return CreateResult{Failure: "submission gate could not be confirmed", Ambiguous: true}, nil
 	}
-	return CreateResult{Job: controlJob(job)}, nil
+	return result, nil
 }
 
 func (a *ServiceActivities) Find(ctx context.Context, ref model.BatchRef, fileID string) (CreateResult, error) {

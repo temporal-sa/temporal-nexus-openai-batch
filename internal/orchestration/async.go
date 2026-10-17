@@ -33,13 +33,15 @@ func (a *ServiceActivities) SubmitRequest(ctx context.Context, input model.SAAIn
 		Namespace: info.Namespace, ActivityID: info.ActivityID, ActivityRunID: info.ActivityRunID,
 		TaskToken: append([]byte(nil), info.TaskToken...), Attempt: info.Attempt,
 	}}
-	// The SAA itself has a single attempt because legacy async completion cannot
-	// separate submission retries from a later externally reported failure.
-	// These short retries reuse the same database identity and fenced target.
+	enrollment.DeadlineAt = info.Deadline
+	// Heartbeat retries recover loss before enrollment. After commit the store's
+	// heartbeat keeper owns liveness; a new attempt can reattach this execution
+	// without admitting another request or resubmitting the provider batch.
 	enrollCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	var err error
 	for attempt := 0; attempt < 5; attempt++ {
+		activity.RecordHeartbeat(ctx, input.Request.RequestID)
 		_, err = a.Enroll(enrollCtx, enrollment)
 		if err == nil {
 			return model.Result{}, activity.ErrResultPending

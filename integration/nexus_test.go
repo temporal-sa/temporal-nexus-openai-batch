@@ -374,27 +374,32 @@ func testStaleAttempt(t *testing.T) {
 	h := newHarness(t, "success", 3*time.Second, true)
 	cfg := h.config()
 	cfg.Window = 150 * time.Millisecond
+	cfg.ResultDeadline, cfg.OperationTimeout = 6*time.Second, 8*time.Second
 	coord := h.coordinator(cfg)
 	request := h.request(0)
-	// Production Nexus starts one SAA attempt. Explicitly enable two attempts
-	// here to verify that a timeout cannot silently authorize another upstream
-	// submission or let the old completion token complete a new attempt.
+	// Force a superseding attempt, then prove the old token stays fenced while
+	// the new attempt reattaches to the original batch and receives its result.
 	handle, err := h.c.ExecuteActivity(h.ctx, client.StartActivityOptions{
 		ID: "retry-saa/" + h.id, TaskQueue: h.serviceQueue,
-		StartToCloseTimeout: time.Second, ScheduleToCloseTimeout: 10 * time.Second,
-		RetryPolicy: &temporal.RetryPolicy{InitialInterval: 100 * time.Millisecond, MaximumAttempts: 2},
+		StartToCloseTimeout: cfg.OperationTimeout, ScheduleToCloseTimeout: cfg.OperationTimeout,
+		HeartbeatTimeout: 2 * time.Second,
+		RetryPolicy:      &temporal.RetryPolicy{InitialInterval: 100 * time.Millisecond, MaximumAttempts: 2},
 	}, "SubmitRequest", model.SAAInput{Request: request, Config: cfg})
 	if err != nil {
 		t.Fatal(err)
 	}
 	h.activities = append(h.activities, handle)
 	target := h.waitHandoff()
+	newTarget := h.waitHandoff()
+	if newTarget.Attempt <= target.Attempt || newTarget.ActivityRunID != target.ActivityRunID {
+		t.Fatal("retry did not preserve execution identity and advance its attempt")
+	}
 	var result model.Result
 	err = handle.Get(h.ctx, &result)
-	var application *temporal.ApplicationError
-	if !errors.As(err, &application) || application.Type() != "STALE_ACTIVITY_ATTEMPT" {
-		t.Fatalf("new attempt must not replace an already-admitted completion token: %v", err)
+	if err != nil {
+		t.Fatalf("new attempt did not receive the original batch result: %v", err)
 	}
+	assertResult(t, request, result)
 	err = h.c.CompleteActivity(h.ctx, target.TaskToken, model.Result{RequestID: request.RequestID, Text: "stale completion"}, nil)
 	var missing *serviceerror.NotFound
 	if !errors.As(err, &missing) {
@@ -402,7 +407,7 @@ func testStaleAttempt(t *testing.T) {
 	}
 	status := h.finish(coord)
 	assertReport(t, status, 1, 1)
-	if h.persistedJobs() != 1 || status.Batches[0].Skipped != 1 {
+	if h.persistedJobs() != 1 || status.Batches[0].Delivered != 1 {
 		t.Fatalf("retry changed upstream submission or completed a stale recipient: %+v", status)
 	}
 }
@@ -997,7 +1002,7 @@ func (h *harness) assertServiceHasNoRequestWorkflows() {
 		h.t.Fatal(err)
 	}
 	for _, execution := range response.Executions {
-		if execution.Type.Name != "BatchWorkflow" {
+		if execution.Type.Name != "BatchWorkflow" && execution.Type.Name != orchestration.BatchWorkflowType {
 			h.t.Fatalf("service started a per-request or unexpected Workflow: %s", execution.Type.Name)
 		}
 	}

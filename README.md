@@ -17,11 +17,17 @@ Postgres is the source of truth for enrollment and batch data. There is no coord
 
 Enrollment uses one database transaction to validate ownership, enforce an optional admission limit, append the request, and seal a batch at its count or byte limit. A retry with the same fingerprint and exact Activity attempt target returns its original assignment. Another operation using the same logical request ID is rejected. Transactions lock the run row before its open batch row, so concurrent enrollment, timer sealing and admission closure use one lock order.
 
+SAAs use a 30-second heartbeat timeout so a lost worker can retry before enrollment commits. After enrollment, an independent keeper heartbeats pending targets from Postgres. A strictly newer attempt of the same SAA execution can reattach to its existing request, membership and result. Older attempts remain fenced, including at the delivery checkpoint. The keeper also delivers stored outcomes to late reattachments after their batch Workflow closes.
+
 Dispatchers poll the indexed Postgres outbox by namespace, mode and Nexus endpoint. Short database leases let multiple workers claim work. Each batch has a stable Workflow ID with duplicate execution rejected. If a dispatcher crashes after starting Temporal work but before recording its acknowledgment, retrying the same ID cannot create another execution.
 
 Results are committed before delivery. One heartbeat-enabled delivery Activity pages through pending rows and checkpoints completed recipients in Postgres. If a completion acknowledgment or database checkpoint is lost, retry reconciles the exact closed SAA outcome. Completion always uses the original task token and never falls back to completing a newer attempt by ID.
 
 Uploads and provider batch creation are separate persisted Activities. Creation has **one attempt**, including at the HTTP layer. An uncertain response is reconciled using metadata and the uploaded file ID. Zero or multiple matches produce `SUBMISSION_UNKNOWN`; no replacement job is submitted automatically. The prototype does not promise exactly-once provider execution or billing.
+
+Provider creation holds the run's database lock through its bounded HTTP call. A stop waits for an already-started submission and prevents subsequent creation calls for that run. An upstream job already accepted by OpenAI can continue after cleanup.
+
+The provider deadline is capped by the earliest stored SAA deadline, retaining the configured delivery reserve. Overdue sealing does not restart the full provider budget. Polling runs inside one heartbeat-enabled Activity, so a day-long job does not add thousands of timer and Activity events to Workflow history. Result persistence, delivery and final reports continue retrying after recipient expiry so database recovery can still produce terminal bookkeeping.
 
 ## Run locally
 
@@ -101,6 +107,8 @@ Caller cancellation reaches the SAA through Nexus. After `ErrResultPending`, no 
 
 `cleanup` stops new dispatch for the named Postgres run, cancels its Temporal Workflows, and terminates its remaining SAAs. It retains database records, history, fake-provider state, and provider jobs/files. Stop workers and Temporal with Ctrl-C. `make postgres-stop` stops only the native development cluster; `docker compose down` stops the Compose instance while preserving its named volume.
 
+Cleanup uses Postgres batch/recipient identities and supplements them with Temporal visibility for callers and older resources. A Workflow already claimed by a dispatcher can still start after a stop, but the database submission fence prevents it from creating a new provider job.
+
 Use `TEMPORAL_ADDRESS` / `TEMPORAL_NAMESPACE` or CLI connection flags for another local Temporal service. Production authentication and deployment are outside this prototype.
 
 ## Fake and live providers
@@ -132,12 +140,20 @@ The collection window plus provider result deadline must be less than the operat
 
 This removes batch-size growth from Workflow payloads and per-item completion events from batch histories. Activities still materialize a bounded provider manifest/file in worker memory, and enrollment for one run takes a short Postgres row lock. Production throughput, connection sizing, retention, and partitioning need measurement; a larger configured limit is not a throughput benchmark.
 
-External completion uses the conventional `ErrResultPending` path. Ordinary Activity timeouts span enrollment and external work; separate phase timeout/retry policies are unsupported. Recovery is verified after the database enrollment commits. A worker killed before that commit can leave a single-attempt SAA waiting until its ordinary timeout (two minutes fake, 26 hours live).
+External completion uses the conventional `ErrResultPending` path. Ordinary Activity timeouts span enrollment and external work; separate first-class phase timeout/retry policies remain unsupported. Heartbeat timeout recovery and transactional reattachment cover worker loss before and after enrollment. Externally reported business failures are nonretryable and do not resubmit a provider job. The keeper adds periodic heartbeat RPCs per pending request; size the service for that load.
 
 ```sh
 bin/batchctl capabilities
 bin/batchctl capabilities --require-handoff  # rejects unsupported phase policies
 ```
+
+## Deploy and upgrade Workers
+
+New batches use Workflow type `BatchWorkflowV2` on a separate `-batches-v2` task queue. Workers retain the original `BatchWorkflow` implementation on the original queue to replay and drain existing executions. Schema migration v2 is additive; old rows retain an admission-based deadline approximation because their original SAA deadline was not stored.
+
+The CLI isolates enrollment from batch Activities and exposes `--service-concurrency` and `--batch-concurrency` (both default to 32). Set batch concurrency for available memory, provider capacity and the expected number of concurrent polling Activities. Large provider files can occupy several times their encoded size in memory.
+
+For an upgrade, run the schema migration, start the new Workers, and keep the legacy Workflow registration until old executions and required replay retention have drained. Run saved-history replay tests before deployment. Future incompatible Workflow changes need a new type/queue generation or replay-compatible patches; do not edit the frozen legacy implementation.
 
 ## Verification
 

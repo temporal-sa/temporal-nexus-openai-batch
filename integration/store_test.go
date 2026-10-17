@@ -169,10 +169,10 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		if err != nil || len(rows) != 25 || rows[0].Outcome.Result.Text != "original immutable result" {
 			t.Fatalf("outcomes were not immutable: count=%d error=%v", len(rows), err)
 		}
-		if err := db.MarkDelivered(ctx, ref.BatchID, rows[0].RequestID, true, ""); err != nil {
+		if err := db.MarkDelivered(ctx, ref.BatchID, rows[0].RequestID, rows[0].Target, true, ""); err != nil {
 			t.Fatal(err)
 		}
-		if err := other.MarkDelivered(ctx, ref.BatchID, rows[0].RequestID, false, "late retry"); err != nil {
+		if err := other.MarkDelivered(ctx, ref.BatchID, rows[0].RequestID, rows[0].Target, false, "late retry"); err != nil {
 			t.Fatal(err)
 		}
 		reopened, err := store.Open(ctx, dsn, namespace)

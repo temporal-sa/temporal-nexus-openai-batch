@@ -188,7 +188,7 @@ func (r *pagedDeliveryRepository) PendingDeliveries(_ context.Context, _ string,
 	}
 	return page, nil
 }
-func (r *pagedDeliveryRepository) MarkDelivered(_ context.Context, _ string, requestID string, delivered bool, _ string) error {
+func (r *pagedDeliveryRepository) MarkDelivered(_ context.Context, _ string, requestID string, _ model.CompletionTarget, delivered bool, _ string) error {
 	r.marked[requestID] = delivered
 	return nil
 }
