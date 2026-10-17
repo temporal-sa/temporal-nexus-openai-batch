@@ -163,6 +163,8 @@ async def worker_process(
         child = await asyncio.create_subprocess_exec(
             *command,
             "worker",
+            "--mode",
+            "fake",
             "--address",
             os.getenv("TEMPORAL_ADDRESS", "127.0.0.1:7234"),
             "--namespace",

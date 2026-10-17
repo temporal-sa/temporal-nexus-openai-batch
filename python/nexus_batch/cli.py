@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import asyncpg
+from dotenv import load_dotenv
 
 from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
 from temporalio.api.operatorservice.v1 import CreateNexusEndpointRequest, ListNexusEndpointsRequest
@@ -22,6 +23,11 @@ from .provider import FakeProvider, OpenAIProvider
 from .runtime import queues, running_workers
 from .store import LOCAL_DSN, Store
 from .workflows import CallerWorkflow
+
+
+def load_environment(path: Path | None = None) -> None:
+    """Load the repository's .env without replacing exported environment values."""
+    load_dotenv(path or Path(__file__).resolve().parents[2] / ".env", override=False)
 
 
 async def initialize_database(dsn: str) -> None:
@@ -73,6 +79,9 @@ def configuration(args) -> Config:
     config = Config.defaults(args.mode)
     config.nexus_endpoint = queues(args.mode)[3]
     config.model = args.model or (os.environ.get("OPENAI_MODEL", "") if args.mode == "live" else config.model)
+    if args.mode == "live" and not config.model.strip():
+        raise ValueError("Set OPENAI_MODEL in .env or pass --model to choose a model for live batches")
+    config.model = config.model.strip()
     for flag, field in [
         ("window", "window"),
         ("batch_size", "max_batch_requests"),
@@ -190,6 +199,12 @@ async def cleanup(client: Client, store: Store, run_id: str) -> None:
         raise RuntimeError(f"run stopped; {len(errors)} Temporal cleanup operations could not be confirmed")
 
 
+def _mode(value: str) -> str:
+    if value not in {"fake", "live"}:
+        raise argparse.ArgumentTypeError("NEXUS_BATCH_MODE or --mode must be fake or live")
+    return value
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(description=__doc__)
     commands = command.add_subparsers(dest="command", required=True)
@@ -198,7 +213,9 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument("--address", default=os.getenv("TEMPORAL_ADDRESS", "127.0.0.1:7234"))
         sub.add_argument("--namespace", default=os.getenv("TEMPORAL_NAMESPACE", "default"))
         sub.add_argument("--database-url", default=os.getenv("PYTHON_DATABASE_URL", LOCAL_DSN))
-        sub.add_argument("--mode", choices=["fake", "live"], default="fake")
+        sub.add_argument(
+            "--mode", choices=["fake", "live"], type=_mode, default=os.getenv("NEXUS_BATCH_MODE") or "fake"
+        )
         if name in {"demo", "inspect", "finish", "cancel", "cleanup"}:
             sub.add_argument("--run-id", required=True)
         if name == "cancel":
@@ -223,6 +240,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 async def run(args) -> int:
+    if args.command == "worker" and args.mode == "live" and not os.getenv("OPENAI_API_KEY", "").strip():
+        raise ValueError("Set OPENAI_API_KEY in .env before starting a live worker")
+    if args.command == "demo":
+        configuration(args)
     if args.command == "setup":
         await setup(await Client.connect(args.address, namespace=args.namespace), args.mode)
         print("Nexus endpoint ready")
@@ -245,7 +266,7 @@ async def run(args) -> int:
                 provider = (
                     FakeProvider(args.state_dir, args.scenario, args.processing_delay)
                     if args.mode == "fake"
-                    else OpenAIProvider(os.environ.get("OPENAI_API_KEY", ""))
+                    else OpenAIProvider(os.environ.get("OPENAI_API_KEY", "").strip())
                 )
                 try:
                     async with running_workers(
@@ -276,6 +297,7 @@ async def run(args) -> int:
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     try:
+        load_environment()
         status = asyncio.run(run(parser().parse_args()))
     except KeyboardInterrupt:
         status = 130

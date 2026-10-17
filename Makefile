@@ -4,6 +4,9 @@ export GOMODCACHE ?= $(CURDIR)/.cache/go-mod
 TEMPORAL_ADDRESS ?= 127.0.0.1:7234
 MODE ?= fake
 PYTHON := python/.venv/bin/python
+# Empty means the Python CLI uses NEXUS_BATCH_MODE from .env or the environment.
+PYTHON_MODE ?=
+PYTHON_MODE_FLAG = $(if $(PYTHON_MODE),--mode $(PYTHON_MODE))
 PYTHON_DATABASE_URL ?= postgres://nexus_batch:nexus_batch@127.0.0.1:54329/nexus_batch_python?sslmode=disable
 
 .PHONY: build test test-integration test-store runtime postgres postgres-docker postgres-stop init-db server setup worker demo live inspect clean
@@ -45,13 +48,13 @@ clean:
 python-install:
 	uv sync --project python --extra test
 python-init:
-	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m nexus_batch init-db
+	$(PYTHON) -m nexus_batch init-db
 python-setup:
-	$(PYTHON) -m nexus_batch setup --mode $(MODE) --address $(TEMPORAL_ADDRESS)
+	$(PYTHON) -m nexus_batch setup $(PYTHON_MODE_FLAG)
 python-worker:
-	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m nexus_batch worker --mode $(MODE) --address $(TEMPORAL_ADDRESS)
+	$(PYTHON) -m nexus_batch worker $(PYTHON_MODE_FLAG)
 python-demo:
-	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m nexus_batch demo --mode $(MODE) --address $(TEMPORAL_ADDRESS) --run-id python-$$(date +%s)
+	$(PYTHON) -m nexus_batch demo $(PYTHON_MODE_FLAG) --run-id python-$$(date +%s) --input samples/documents.jsonl
 python-test:
 	$(PYTHON) -m pytest -q python/tests
 	$(PYTHON) -m ruff check python

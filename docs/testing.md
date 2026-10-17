@@ -36,6 +36,8 @@ make python-test-integration
 
 Workflow tests use Temporal's time-skipping test server, which the SDK downloads on first use. They cover deadlines crossed during storage outages, no provider work after expiry, one-attempt creation with lost acknowledgement, and bookkeeping retries beyond recipient expiry.
 
+CLI subprocesses in the integration tests explicitly select fake mode, even when the local `.env` selects live. Configuration tests cover `.env` loading, overrides, live-provider selection and missing credentials without calling OpenAI.
+
 Integration tests own the Python task queues; stop `python-worker` first. They exercise real Nexus callbacks and inspect the backing Standalone Activities. Provider scenarios include success, per-request errors, expiry, missing/duplicate/unknown/malformed output, and ambiguous submissions. Recovery checks use persisted fake-provider state and real process loss.
 
 Both implementations use bounded manifests in Activity memory and PostgreSQL. Passing local correctness tests does not establish production throughput, maximum-size batch performance, live provider latency, retention behavior or provider-file cleanup. Paid OpenAI submissions are outside the automated suites.

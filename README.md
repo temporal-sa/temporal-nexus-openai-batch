@@ -74,7 +74,7 @@ The default Go database URL is:
 postgres://nexus_batch:nexus_batch@127.0.0.1:54329/nexus_batch?sslmode=disable
 ```
 
-Override it with `DATABASE_URL`. Schema initialization is automatic when the store opens; `make init-db` runs it explicitly. `.env.example` documents environment variables; neither application loads `.env` automatically. Each implementation uses its own database and queues. Use a separate database for each Temporal cluster.
+Override it with `DATABASE_URL`. Schema initialization is automatic when the store opens; `make init-db` runs it explicitly. The Python CLI loads the repository-root `.env` automatically; exported values take precedence. `.env.example` lists the settings. Export the variables when using the Go CLI. Each implementation uses its own database and queues. Use a separate database for each Temporal cluster.
 
 ## Inspect and control
 

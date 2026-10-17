@@ -11,10 +11,17 @@ make postgres          # or: make postgres-docker
 make server            # includes activity.enableCallbacks=true
 ```
 
-Install the Python application and initialize its database:
+Install the Python application:
 
 ```sh
 uv sync --project python --extra test
+test -f .env || cp .env.example .env
+chmod 600 .env
+```
+
+Fill in `OPENAI_API_KEY` and `OPENAI_MODEL` in the repository-root `.env`. Choose a model available to your account that supports Responses and Batch. The provided file sets `NEXUS_BATCH_MODE=live`, which selects the real OpenAI provider at `https://api.openai.com/v1`.
+
+```sh
 make python-init
 make python-setup
 make python-worker
@@ -29,7 +36,7 @@ make python-demo
 python/.venv/bin/batchctl-python demo --run-id python-sample-001 --input samples/documents.jsonl
 ```
 
-Each run ID must be new and unique across both applications in the Temporal namespace. Durations in configuration, CLI flags and reports use **seconds**. A short `--wait` stops waiting without canceling durable work. Use `inspect` to see later progress.
+Each run ID must be new and unique across both applications in the Temporal namespace. `make python-demo` submits the three supplied documents through the selected provider. Durations in configuration, CLI flags and reports use **seconds**. A short `--wait` stops waiting without canceling durable work. Use `inspect` to see later progress.
 
 ```sh
 python/.venv/bin/batchctl-python inspect --run-id python-sample-001
@@ -38,7 +45,9 @@ python/.venv/bin/batchctl-python cancel --run-id python-sample-001 --request-id 
 python/.venv/bin/batchctl-python cleanup --run-id python-sample-001
 ```
 
-The default database is `nexus_batch_python`, configured with `PYTHON_DATABASE_URL`. The default Nexus endpoint is `llm-batch-python`; caller, enrollment and batch queues have the `nexus-batch-python-` prefix. Live mode adds `-live`. Go and Python use independent databases and queues, so both can run on the same Temporal server.
+The CLI loads `.env` before reading its mode, model, Temporal connection and database settings. Exported environment values take precedence over the file; explicit CLI flags take precedence over both. `.env` is ignored by Git.
+
+The default database is `nexus_batch_python`, configured with `PYTHON_DATABASE_URL`. Fake mode uses Nexus endpoint `llm-batch-python`; caller, enrollment and batch queues have the `nexus-batch-python-` prefix. Live mode adds `-live`, so the supplied `.env` selects `llm-batch-python-live`. Go and Python use independent databases and queues, so both can run on the same Temporal server.
 
 ## Structure
 
@@ -57,20 +66,24 @@ Creation has one Activity attempt and one HTTP attempt. Ambiguous submissions ar
 
 ## Fake and live providers
 
-The fake provider persists jobs and files under `.state/python-fake` and shares them safely between processes. Stop the normal fake worker before running another scenario on its queues:
+Live mode uses the key and model from `.env`. A missing key stops a live worker before it connects to PostgreSQL or Temporal; a missing model stops a live demo before it starts any Workflows. The key is read locally and is excluded from Workflow payloads, PostgreSQL records and reports.
+
+The fake provider persists jobs and files under `.state/python-fake` and shares them safely between processes. To run without OpenAI, explicitly select fake mode:
 
 ```sh
-python/.venv/bin/batchctl-python worker --scenario mixed --state-dir .state/python-mixed
-```
-
-For paid requests, export `OPENAI_API_KEY` and `OPENAI_MODEL`:
-
-```sh
-make python-setup MODE=live
-make python-worker MODE=live
+make python-setup PYTHON_MODE=fake
+make python-worker PYTHON_MODE=fake
 # Another terminal:
-python/.venv/bin/batchctl-python demo --mode live --run-id python-live-001 --count 3 --wait 180
+make python-demo PYTHON_MODE=fake
 ```
+
+Stop the normal fake worker before running another scenario on its queues:
+
+```sh
+python/.venv/bin/batchctl-python worker --mode fake --scenario mixed --state-dir .state/python-mixed
+```
+
+Override the configured mode for a single CLI command with `--mode`, or for a Make target with `PYTHON_MODE`. Both the worker and its demo must select the same mode.
 
 Live mode uses the Responses Batch endpoint. Chat Completions support is on hold. The bounds and recovery semantics described in the [repository README](../README.md) apply to both applications.
 
