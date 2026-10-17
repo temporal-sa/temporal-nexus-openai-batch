@@ -15,16 +15,12 @@ const (
 	CallerTaskQueue      = "nexus-batch-callers"
 	ServiceTaskQueue     = "nexus-batch-service"
 	NexusEndpoint        = "llm-batch"
-	EnrollUpdate         = "enroll"
-	FinishUpdate         = "finish"
 	StatusQuery          = "status"
-	ConfigQuery          = "config"
-	BatchProgressSignal  = "batch-progress"
 	MaxRequestBytes      = 8 * 1024
 	MaxResultBytes       = 4 * 1024
-	HardMaxAdmissions    = 1000
-	HardMaxBatchRequests = 100
-	HardMaxBatchBytes    = 512 * 1024
+	HardMaxBatchRequests = 50_000
+	HardMaxBatchBytes    = 200_000_000
+	DefaultBatchBytes    = 512 * 1024
 )
 
 type Request struct {
@@ -76,7 +72,7 @@ type Config struct {
 
 func DefaultConfig(mode string) Config {
 	c := Config{Model: "fake-model", Mode: mode, Window: 5 * time.Second, MaxBatchRequests: 100,
-		MaxBatchBytes: HardMaxBatchBytes, MaxAdmissions: HardMaxAdmissions, PollInterval: 250 * time.Millisecond,
+		MaxBatchBytes: DefaultBatchBytes, MaxAdmissions: 0, PollInterval: 250 * time.Millisecond,
 		ResultDeadline: time.Minute, OperationTimeout: 2 * time.Minute, MaxOutputTokens: 128, Endpoint: NexusEndpoint}
 	if mode == "live" {
 		c.Model = ""
@@ -97,8 +93,13 @@ func (c Config) Validate() error {
 	if c.Window <= 0 || c.PollInterval <= 0 || c.ResultDeadline <= c.Window || c.OperationTimeout <= c.ResultDeadline {
 		return fmt.Errorf("durations must be positive, with window < result deadline < operation timeout")
 	}
-	if c.MaxBatchRequests < 1 || c.MaxBatchRequests > HardMaxBatchRequests || c.MaxBatchBytes < 1 || c.MaxBatchBytes > HardMaxBatchBytes || c.MaxAdmissions < 1 || c.MaxAdmissions > HardMaxAdmissions {
-		return fmt.Errorf("limits must stay within 100 requests/batch, 512 KiB/batch and 1000 admissions/run")
+	// Subtract after the positive ordering check, so even maximum-duration
+	// inputs cannot overflow while checking the complete collection budget.
+	if c.Window >= c.OperationTimeout-c.ResultDeadline {
+		return fmt.Errorf("collection window plus result deadline must be less than operation timeout")
+	}
+	if c.MaxBatchRequests < 1 || c.MaxBatchRequests > HardMaxBatchRequests || c.MaxBatchBytes < 1 || c.MaxBatchBytes > HardMaxBatchBytes || c.MaxAdmissions < 0 {
+		return fmt.Errorf("batch limits must stay within 50,000 requests and 200 MB, and max admissions must be nonnegative (0 is unlimited)")
 	}
 	if c.MaxOutputTokens < 16 || c.MaxOutputTokens > 512 {
 		return fmt.Errorf("max output tokens must be between 16 and 512")
@@ -159,6 +160,34 @@ type Manifest struct {
 	Bytes    int       `json:"bytes"`
 }
 
+// BatchRef is the entire orchestration payload. It contains no request bodies,
+// results, completion targets, or task tokens; those remain in external storage.
+type BatchRef struct {
+	RunID           string    `json:"run_id"`
+	BatchID         string    `json:"batch_id"`
+	Config          Config    `json:"config"`
+	Requests        int       `json:"requests"`
+	Bytes           int       `json:"bytes"`
+	SealedAt        time.Time `json:"sealed_at"`
+	FirstAdmittedAt time.Time `json:"first_admitted_at"`
+}
+
+// StoredDelivery is loaded and consumed within an Activity, never a Workflow.
+type StoredDelivery struct {
+	RequestID string           `json:"request_id"`
+	Target    CompletionTarget `json:"completion_target"`
+	Outcome   Outcome          `json:"outcome"`
+}
+
+type DeliverySummary struct {
+	Delivered     int            `json:"delivered"`
+	Skipped       int            `json:"skipped"`
+	Succeeded     int            `json:"succeeded"`
+	Failed        int            `json:"failed"`
+	FailureCounts map[string]int `json:"failure_counts,omitempty"`
+	Diagnostics   []string       `json:"diagnostics,omitempty"`
+}
+
 type BatchReport struct {
 	BatchID          string         `json:"batch_id"`
 	ProviderBatchID  string         `json:"provider_batch_id,omitempty"`
@@ -181,6 +210,7 @@ type BatchReport struct {
 type RunStatus struct {
 	RunID          string        `json:"run_id"`
 	Backing        string        `json:"backing"`
+	Storage        string        `json:"storage"`
 	CompletionMode string        `json:"completion_mode"`
 	Admitted       int           `json:"admitted"`
 	Buffered       int           `json:"buffered"`
@@ -212,7 +242,6 @@ func Fingerprint(r Request) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
 }
-func CoordinatorID(runID string) string       { return "batch-coordinator/" + runID }
 func BatchWorkflowID(batchID string) string   { return "batch/" + batchID }
 func CallerID(runID, requestID string) string { return "caller/" + runID + "/" + requestID }
 

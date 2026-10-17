@@ -18,6 +18,7 @@ import (
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/model"
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/orchestration"
 	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/provider"
+	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/store"
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
@@ -67,6 +68,31 @@ func printJSON(v any) error {
 	return enc.Encode(v)
 }
 
+func openStore(ctx context.Context, namespace string) (*store.Store, error) {
+	db, err := store.Open(ctx, env("DATABASE_URL", store.LocalDSN), namespace)
+	if err != nil {
+		return nil, fmt.Errorf("open Postgres store: %w", err)
+	}
+	return db, nil
+}
+
+func migrate(args []string) error {
+	f := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	var conn connection
+	conn.flags(f)
+	if err := f.Parse(args); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := openStore(ctx, conn.namespace)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return printJSON(map[string]any{"store": "postgres", "namespace": conn.namespace, "schema": "ready"})
+}
+
 func capabilities(args []string) error {
 	f := flag.NewFlagSet("capabilities", flag.ContinueOnError)
 	var conn connection
@@ -107,11 +133,13 @@ func capabilities(args []string) error {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: batchctl <worker|demo|inspect|finish|cancel|cleanup|capabilities> [flags]; see README.md")
+		return fmt.Errorf("usage: batchctl <worker|demo|inspect|finish|cancel|cleanup|capabilities|migrate> [flags]; see README.md")
 	}
 	switch args[0] {
 	case "capabilities":
 		return capabilities(args[1:])
+	case "migrate":
+		return migrate(args[1:])
 	case "worker":
 		return runWorker(args[1:])
 	case "demo":
@@ -147,13 +175,22 @@ func runWorker(args []string) error {
 	if err != nil {
 		return err
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	dbCtx, dbCancel := context.WithTimeout(ctx, 30*time.Second)
+	db, err := openStore(dbCtx, conn.namespace)
+	dbCancel()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
 	c, err := conn.dial()
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 	sw := worker.New(c, serviceQueue(*mode), worker.Options{})
-	orchestration.RegisterService(sw, c, p)
+	orchestration.RegisterService(sw, c, p, db)
 	cw := worker.New(c, model.CallerTaskQueue, worker.Options{})
 	orchestration.RegisterCaller(cw)
 	if err = sw.Start(); err != nil {
@@ -164,11 +201,21 @@ func runWorker(args []string) error {
 		return err
 	}
 	defer cw.Stop()
-	fmt.Fprintf(os.Stderr, "Workers ready: mode=%s service_queue=%s endpoint=%s\n", *mode, serviceQueue(*mode), endpoint(*mode))
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	fmt.Fprintf(os.Stderr, "Workers ready: mode=%s service_queue=%s endpoint=%s store=postgres\n", *mode, serviceQueue(*mode), endpoint(*mode))
+	dispatchErr := make(chan error, 1)
+	go func() {
+		dispatchErr <- orchestration.Dispatcher(ctx, c, db, *mode, serviceQueue(*mode), endpoint(*mode))
+	}()
 	defer stop()
-	<-ctx.Done()
-	return nil
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-dispatchErr:
+		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
 }
 
 type itemReport struct {
@@ -179,15 +226,16 @@ type itemReport struct {
 	Error      string        `json:"error,omitempty"`
 }
 type demoReport struct {
-	RunID     string          `json:"run_id"`
-	Mode      string          `json:"mode"`
-	Simulated bool            `json:"simulated"`
-	Elapsed   time.Duration   `json:"elapsed_ns"`
-	Succeeded int             `json:"succeeded"`
-	Failed    int             `json:"failed"`
-	Pending   int             `json:"pending"`
-	Status    model.RunStatus `json:"status"`
-	Items     []itemReport    `json:"items"`
+	RunID       string          `json:"run_id"`
+	Mode        string          `json:"mode"`
+	Simulated   bool            `json:"simulated"`
+	Elapsed     time.Duration   `json:"elapsed_ns"`
+	Succeeded   int             `json:"succeeded"`
+	Failed      int             `json:"failed"`
+	Pending     int             `json:"pending"`
+	Status      model.RunStatus `json:"status"`
+	StatusError string          `json:"status_error,omitempty"`
+	Items       []itemReport    `json:"items"`
 }
 
 func runDemo(args []string) error {
@@ -199,9 +247,9 @@ func runDemo(args []string) error {
 	n := f.Int("count", 0, "number of synthetic documents (default 100 fake or 5 live)")
 	input := f.String("input", "", "JSONL file containing request_id and input")
 	window := f.Duration("window", 5*time.Second, "collection window")
-	maxBatch := f.Int("batch-size", 100, "maximum requests per batch, at most 100")
-	maxBytes := f.Int("batch-bytes", model.HardMaxBatchBytes, "maximum JSONL bytes per batch")
-	maxAdmissions := f.Int("max-admissions", 1000, "maximum unique run admissions, at most 1000")
+	maxBatch := f.Int("batch-size", 100, "maximum requests per batch, at most 50000")
+	maxBytes := f.Int("batch-bytes", 512*1024, "maximum JSONL bytes per batch, at most 200000000")
+	maxAdmissions := f.Int("max-admissions", 0, "optional maximum unique run admissions; 0 is unlimited")
 	modelName := f.String("model", os.Getenv("OPENAI_MODEL"), "live model; alternatively OPENAI_MODEL")
 	wait := f.Duration("wait", 0, "maximum CLI wait, default operation timeout plus 1 minute")
 	if err := f.Parse(args); err != nil {
@@ -232,7 +280,7 @@ func runDemo(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(reqs) > cfg.MaxAdmissions {
+	if cfg.MaxAdmissions > 0 && len(reqs) > cfg.MaxAdmissions {
 		return fmt.Errorf("%d documents exceeds run admission limit %d", len(reqs), cfg.MaxAdmissions)
 	}
 	if *wait == 0 {
@@ -245,10 +293,14 @@ func runDemo(args []string) error {
 		return err
 	}
 	defer c.Close()
-	start := time.Now()
-	coord, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: model.CoordinatorID(*id), TaskQueue: serviceQueue(*mode), WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE}, orchestration.CoordinatorWorkflow, model.RunInput{RunID: *id, Config: cfg})
+	db, err := openStore(ctx, conn.namespace)
 	if err != nil {
-		return fmt.Errorf("start coordinator (choose a new --run-id for each demo): %w", err)
+		return err
+	}
+	defer db.Close()
+	start := time.Now()
+	if err = db.CreateRun(ctx, model.RunInput{RunID: *id, Config: cfg}); err != nil {
+		return fmt.Errorf("create run (choose a new --run-id for each demo): %w", err)
 	}
 	report := demoReport{RunID: *id, Mode: *mode, Simulated: *mode == "fake", Items: make([]itemReport, len(reqs))}
 	var wg sync.WaitGroup
@@ -286,35 +338,63 @@ func runDemo(args []string) error {
 		}
 	}
 	if ctx.Err() != nil || report.Pending > 0 {
+		statusCtx, statusCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		refreshReportStatus(statusCtx, db, &report)
+		statusCancel()
 		report.Elapsed = time.Since(start)
 		_ = printJSON(report)
 		return fmt.Errorf("CLI wait ended with %d unconfirmed outcome(s); Workflows continue durably; inspect run %s or cancel explicitly", report.Pending, *id)
 	}
-	h, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: coord.GetID(), RunID: coord.GetRunID(), UpdateID: "finish", UpdateName: model.FinishUpdate, WaitForStage: client.WorkflowUpdateStageCompleted})
-	if err != nil {
+	if err = db.FinishRun(ctx, *id); err != nil {
 		report.Elapsed = time.Since(start)
 		_ = printJSON(report)
 		return fmt.Errorf("close admission: %w", err)
 	}
-	var ack model.RunStatus
-	if err = h.Get(ctx, &ack); err != nil {
-		report.Elapsed = time.Since(start)
-		_ = printJSON(report)
-		return err
-	}
-	if err = coord.Get(ctx, &report.Status); err != nil {
-		report.Elapsed = time.Since(start)
-		_ = printJSON(report)
-		return fmt.Errorf("finish coordinator: %w", err)
+	for {
+		refreshReportStatus(ctx, db, &report)
+		if report.StatusError != "" || runComplete(report.Status) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			report.StatusError = "launcher stopped waiting for the stored batch report"
+		case <-time.After(100 * time.Millisecond):
+			continue
+		}
+		break
 	}
 	report.Elapsed = time.Since(start)
 	if err = printJSON(report); err != nil {
 		return err
 	}
+	if report.StatusError != "" {
+		return fmt.Errorf("stored report unavailable: %s", report.StatusError)
+	}
 	if report.Failed > 0 {
 		return fmt.Errorf("%d request(s) failed; see per-request report", report.Failed)
 	}
 	return nil
+}
+
+func refreshReportStatus(ctx context.Context, db *store.Store, report *demoReport) {
+	status, err := db.Status(ctx, report.RunID)
+	if err != nil {
+		report.StatusError = "could not read Postgres batch progress; inspect the run to retry"
+		return
+	}
+	report.Status, report.StatusError = status, ""
+}
+
+func runComplete(status model.RunStatus) bool {
+	if !status.Closed || status.Buffered != 0 {
+		return false
+	}
+	for _, batch := range status.Batches {
+		if batch.Status != "completed" && batch.Status != "completed_with_errors" && batch.Status != "workflow_failed" {
+			return false
+		}
+	}
+	return true
 }
 
 func recordItemError(item *itemReport, err error) {
@@ -354,8 +434,8 @@ func documents(runID, path string, n int) ([]model.Request, error) {
 			return nil, err
 		}
 	} else {
-		if n < 1 || n > model.HardMaxAdmissions {
-			return nil, fmt.Errorf("count must be 1-%d", model.HardMaxAdmissions)
+		if n < 1 {
+			return nil, fmt.Errorf("count must be positive")
 		}
 		for i := 0; i < n; i++ {
 			out = append(out, model.Request{RunID: runID, RequestID: fmt.Sprintf("document-%04d", i+1), Input: fmt.Sprintf("Summarize in two sentences. Document %d: A small library expanded its opening hours after residents requested evening access. Volunteers staffed the additional sessions, and the library will review attendance next month.", i+1)})
@@ -392,13 +472,38 @@ func control(command string, args []string) error {
 	if err := model.ValidateRequest(model.Request{RunID: *id, RequestID: "validate", Input: "validate"}); err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if command == "inspect" || command == "finish" || command == "cleanup" {
+		db, err := openStore(ctx, conn.namespace)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		if command == "finish" {
+			if err = db.FinishRun(ctx, *id); err != nil {
+				return err
+			}
+		}
+		if command != "cleanup" {
+			status, err := db.Status(ctx, *id)
+			if err != nil {
+				return err
+			}
+			return printJSON(status)
+		}
+		if err = db.StopRun(ctx, *id); err != nil {
+			var failure *model.Failure
+			if !errors.As(err, &failure) || failure.Code != "RUN_NOT_STARTED" {
+				return err
+			}
+		}
+	}
 	c, err := conn.dial()
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	switch command {
 	case "cleanup":
 		return cleanup(ctx, c, *id)
@@ -407,31 +512,6 @@ func control(command string, args []string) error {
 			return fmt.Errorf("--request-id is required")
 		}
 		return c.CancelWorkflow(ctx, model.CallerID(*id, *rid), "")
-	case "finish":
-		h, e := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: model.CoordinatorID(*id), UpdateName: model.FinishUpdate, UpdateID: "finish", WaitForStage: client.WorkflowUpdateStageCompleted})
-		if e != nil {
-			return e
-		}
-		var ack model.RunStatus
-		if e = h.Get(ctx, &ack); e != nil {
-			return e
-		}
-		return printJSON(ack)
-	case "inspect":
-		v, e := c.QueryWorkflow(ctx, model.CoordinatorID(*id), "", model.StatusQuery)
-		if e == nil {
-			var status model.RunStatus
-			e = v.Get(&status)
-			if e != nil {
-				return e
-			}
-			return printJSON(status)
-		}
-		var final model.RunStatus
-		if getErr := c.GetWorkflow(ctx, model.CoordinatorID(*id), "").Get(ctx, &final); getErr != nil {
-			return errors.Join(e, getErr)
-		}
-		return printJSON(final)
 	}
 	return nil
 }
@@ -439,7 +519,7 @@ func control(command string, args []string) error {
 // Select only exact prototype IDs. The extra local check keeps run "demo" from
 // touching another run named "demo-other" when listing batch prefixes.
 func ownedWorkflow(id, runID string) bool {
-	if id == model.CoordinatorID(runID) || strings.HasPrefix(id, "caller/"+runID+"/") || strings.HasPrefix(id, "batch-request/"+runID+"/") {
+	if id == "batch-coordinator/"+runID || strings.HasPrefix(id, "caller/"+runID+"/") || strings.HasPrefix(id, "batch-request/"+runID+"/") {
 		return true
 	}
 	prefix := "batch/" + runID + "-"
@@ -447,7 +527,7 @@ func ownedWorkflow(id, runID string) bool {
 		return false
 	}
 	suffix := strings.TrimPrefix(id, prefix)
-	if len(suffix) != 4 {
+	if len(suffix) < 4 {
 		return false
 	}
 	for _, c := range suffix {
@@ -458,7 +538,7 @@ func ownedWorkflow(id, runID string) bool {
 	return true
 }
 func cleanup(ctx context.Context, c client.Client, runID string) error {
-	q := fmt.Sprintf("ExecutionStatus = 'Running' AND (WorkflowId = '%s' OR WorkflowId STARTS_WITH 'caller/%s/' OR WorkflowId STARTS_WITH 'batch-request/%s/' OR WorkflowId STARTS_WITH 'batch/%s-')", model.CoordinatorID(runID), runID, runID, runID)
+	q := fmt.Sprintf("ExecutionStatus = 'Running' AND (WorkflowId = 'batch-coordinator/%s' OR WorkflowId STARTS_WITH 'caller/%s/' OR WorkflowId STARTS_WITH 'batch-request/%s/' OR WorkflowId STARTS_WITH 'batch/%s-')", runID, runID, runID, runID)
 	var ids []string
 	var cleanupErrors []error
 	var token []byte

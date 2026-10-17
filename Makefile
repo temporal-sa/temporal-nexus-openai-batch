@@ -4,13 +4,23 @@ export GOMODCACHE ?= $(CURDIR)/.cache/go-mod
 TEMPORAL_ADDRESS ?= 127.0.0.1:7234
 MODE ?= fake
 
-.PHONY: build test test-integration runtime server setup worker demo live inspect clean
+.PHONY: build test test-integration test-store runtime postgres postgres-docker postgres-stop migrate server setup worker demo live inspect clean
 build:
 	go build -o bin/batchctl ./cmd/batchctl
 test:
 	go test -race ./internal/... ./cmd/...
 test-integration: build
 	NEXUS_INTEGRATION=1 TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) go test -v -count=1 -timeout=8m ./integration
+test-store:
+	POSTGRES_TEST=1 go test -v -race -count=1 -run TestPostgres ./internal/store ./integration
+postgres:
+	bash scripts/postgres-runtime.sh start
+postgres-stop:
+	bash scripts/postgres-runtime.sh stop
+postgres-docker:
+	docker compose up -d --wait postgres
+migrate: build
+	bin/batchctl migrate
 runtime:
 	bash scripts/temporal-runtime.sh --install
 server:

@@ -1,27 +1,31 @@
 # Temporal Nexus OpenAI Batch prototype
 
-Independent Temporal Workflows call `llm-batch.respond`, which starts a **Standalone Activity through Nexus**. That Activity durably enrolls one document, records its attempt-scoped completion token, and returns `activity.ErrResultPending`. The batch service groups requests into OpenAI Batch API jobs and later calls `Client.CompleteActivity` for each result. Temporal completes each Nexus operation from its Activity's outcome. Only OpenAI is simulated in fake mode.
+Independent Temporal Workflows call `llm-batch.respond`, which starts a **Standalone Activity through Nexus**. That Activity enrolls the request in **Postgres**, records its exact attempt-scoped completion token, and returns `activity.ErrResultPending`. A dispatcher starts one Workflow per sealed batch. Its Activities load request data from Postgres, submit and poll OpenAI Batch jobs, store the results, and complete the original SAAs externally. Only OpenAI is simulated in fake mode.
 
-Start with fake mode. Live mode submits paid API requests and requires an explicitly configured model.
+Postgres is the source of truth for enrollment and batch data. There is no coordinator Workflow or per-request Workflow Update. Batch Workflow inputs contain a small `BatchRef`; documents, completion tokens, batch manifests, and individual results never enter batch Workflow history. Each caller still has its own request and result in its own history.
 
-## External async completion
+## Data and recovery
 
-This prototype uses **conventional external async completion on a real Nexus-invoked SAA**. Returning `ErrResultPending` releases the Worker slot; the current SDK does not report a first-class handoff to the server. Describe therefore shows `RUNNING`/`STARTED` while external work is pending. Ordinary Activity timeouts continue across enrollment and external completion. The SAA uses one Activity attempt, with short idempotent enrollment retries inside its Worker body, so a late external failure cannot automatically resubmit the provider job. No short heartbeat timeout is set after handoff.
+| Data | Owner |
+| --- | --- |
+| Run configuration and admission state | Postgres |
+| Requests, fingerprints, exact SAA targets and tokens | Postgres |
+| Batch membership, encoded byte counts, collection deadlines | Postgres |
+| Sealed-batch dispatch outbox | Postgres |
+| Per-item outcomes and delivery checkpoints | Postgres |
+| Provider IDs, timers and small aggregate batch reports | Batch Workflow history, with reports also stored in Postgres |
 
-Worker-crash recovery is verified **after durable enrollment**, when the completion token survives in the coordinator's history. A process killed before enrollment can leave its single-attempt SAA waiting until the ordinary operation timeout: two minutes in fake mode or 26 hours live. Fast recovery before enrollment and independent phase retry rules need further implementation; they are not claimed by this prototype.
+Enrollment uses one database transaction to validate ownership, enforce an optional admission limit, append the request, and seal a batch at its count or byte limit. A retry with the same fingerprint and exact Activity attempt target returns its original assignment. Another operation using the same logical request ID is rejected. Transactions lock the run row before its open batch row, so concurrent enrollment, timer sealing and admission closure use one lock order.
 
-```sh
-bin/batchctl capabilities
-bin/batchctl capabilities --require-handoff  # explicitly fails on this public stack
-```
+Dispatchers poll the indexed Postgres outbox by namespace, mode and Nexus endpoint. Short database leases let multiple workers claim work. Each batch has a stable Workflow ID with duplicate execution rejected. If a dispatcher crashes after starting Temporal work but before recording its acknowledgment, retrying the same ID cannot create another execution.
 
-The report labels its backing as `nexus_standalone_activity` and its completion mode as `external_async_completion_legacy`. It never labels this as the unavailable two-phase protocol. [Published Nexus SAA documentation](https://docs.temporal.io/nexus/standalone-activity), [Server callback gate](https://github.com/temporalio/temporal/blob/v1.32.0/chasm/lib/activity/config.go)
+Results are committed before delivery. One heartbeat-enabled delivery Activity pages through pending rows and checkpoints completed recipients in Postgres. If a completion acknowledgment or database checkpoint is lost, retry reconciles the exact closed SAA outcome. Completion always uses the original task token and never falls back to completing a newer attempt by ID.
+
+Uploads and provider batch creation are separate persisted Activities. Creation has **one attempt**, including at the HTTP layer. An uncertain response is reconciled using metadata and the uploaded file ID. Zero or multiple matches produce `SUBMISSION_UNKNOWN`; no replacement job is submitted automatically. The prototype does not promise exactly-once provider execution or billing.
 
 ## Run locally
 
-The toolchain is Go **1.26.3**, Temporal Go SDK **1.49.0** (pinned in `go.mod`), and the local pinned Temporal CLI **1.9.1**, which bundles Server **1.32.0** and UI **2.54.1**. Go 1.26 or later, Python 3, curl, and a SHA-256 utility are required. No Docker or application database is required. SAA completion callbacks require the newer server and `activity.enableCallbacks=true`; `make server` sets that flag.
-
-Clone the repository and install the pinned official CLI locally, with its release checksum verified:
+The verified stack is Go **1.26.3**, Temporal Go SDK **1.49.0**, pgx **5.11.0**, PostgreSQL **17**, and Temporal CLI **1.9.1** (Server **1.32.0**, UI **2.54.1**). Go 1.26 or later, Python 3, curl, and a SHA-256 utility are needed. Use a Postgres instance plus the local Temporal service.
 
 ```sh
 git clone https://github.com/temporal-sa/temporal-nexus-openai-batch.git
@@ -29,123 +33,121 @@ cd temporal-nexus-openai-batch
 make runtime
 ```
 
-The full 21-case integration suite passes on a fresh dev server started with only `--dynamic-config-value activity.enableCallbacks=true`; no `activity.enableStandalone` override is needed on the pinned runtime. `make server` uses that configuration. CLI 1.7.2 / Server 1.31.1 can complete an SAA but cannot dispatch its Nexus completion callback; use the pinned runtime.
-
-Use three terminals in this directory:
+For a native local Postgres cluster, install PostgreSQL 17 first (`brew install postgresql@17` on macOS), then:
 
 ```sh
-# Terminal 1: persistent local Temporal service, loopback only
+make postgres
+```
+
+The script owns only this repository's `.state/postgres-native` cluster and binds it to loopback port **54329**. Alternatively, with a working Docker daemon:
+
+```sh
+make postgres-docker
+```
+
+Docker Compose uses PostgreSQL 17 with a persistent named volume and the same loopback port. Run one of these database options at a time.
+
+The default development connection is:
+
+```text
+postgres://nexus_batch:nexus_batch@127.0.0.1:54329/nexus_batch?sslmode=disable
+```
+
+Set `DATABASE_URL` in the environment to use another Postgres instance. Workers and CLI commands must use the same database and Temporal namespace. Use a separate database for each Temporal cluster. The connection string is never passed to a Workflow. `.env.example` lists configuration; the program does not load `.env` automatically. Schema migrations run automatically when a store connection opens, serialized by a database advisory lock. `make migrate` applies them explicitly.
+
+Use three terminals:
+
+```sh
+# Terminal 1: persistent local Temporal server
 make server
 ```
 
 ```sh
-# Terminal 2: build, register the Nexus endpoint, start service and caller workers
+# Terminal 2: build, register the endpoint, start workers and dispatcher
 make build
 make setup
 make worker
 ```
 
 ```sh
-# Terminal 3: 100 synthetic documents, default five-second collection window
+# Terminal 3: 100 synthetic documents
 make demo
 
-# Or use the supplied three-document input file
+# Or the supplied three-document input
 bin/batchctl demo --run-id sample-001 --input samples/documents.jsonl
+
+# A larger run, without the former 1,000-admission Workflow bound
+bin/batchctl demo --run-id large-001 --count 2000 --batch-size 1000
 ```
 
-Each run ID must be new, including after a completed run. The CLI prints a JSON report and exits nonzero if any document failed. Durations in the report are nanoseconds. `simulated: true` identifies fake-provider runs; elapsed time also includes real Temporal orchestration.
+Each run ID must be new. The CLI writes a JSON report and exits nonzero for failed or unconfirmed outcomes. Durations are nanoseconds. `simulated: true` identifies fake-provider runs; orchestration and database operations are real.
 
-Open [Temporal Web UI](http://localhost:8234/namespaces/default/workflows). Find `caller/RUN_ID/document-0001`, then follow its Nexus operation link to the Standalone Activity `request-activity/RUN_ID/...`. There is no per-request handler Workflow. `batch-coordinator/RUN_ID` and `batch/RUN_ID-0001` contain shared batching orchestration.
+The Temporal service uses **7234**, its [Web UI](http://localhost:8234/namespaces/default/workflows) uses **8234**, and its database is `.state/temporal-saa.db`. `make server` sets `activity.enableCallbacks=true`; no other dynamic-config override is needed. CLI 1.7.2 / Server 1.31.1 lacks the required SAA callback dispatch.
 
-The dev server uses port **7234**, UI **8234**, and `.state/temporal-saa.db`.
+In the UI, find `caller/RUN_ID/document-0001` and follow its Nexus link to the `request-activity/RUN_ID/...` SAA. Shared batch Workflows are named `batch/RUN_ID-SEQUENCE`. No coordinator or per-request handler Workflow is created.
 
-## Inspect and control a run
+## Inspect and control
 
 ```sh
 bin/batchctl inspect --run-id sample-001
-bin/batchctl cancel --run-id sample-001 --request-id library
 bin/batchctl finish --run-id sample-001
+bin/batchctl cancel --run-id sample-001 --request-id library
 bash scripts/cleanup.sh sample-001
 ```
 
-`inspect` reports the Nexus backing, completion mode, admitted and buffered requests, batch sizes, provider IDs, current states, failure counts, and external completion totals. `finish` closes admission and flushes the current buffer; children continue until completion. The demo launcher normally finishes its run automatically after all callers return.
+`inspect` reads aggregate progress from Postgres. `finish` closes admission and seals any partial batch; already accepted work continues. The demo normally finishes its run after its callers return. A short `--wait` limits the launcher only: pending outcomes remain durable, and workers continue processing them.
 
-`cleanup` requests cancellation for the named run's coordinator, caller, and batch Workflows and explicitly terminates its remaining Standalone Activities. It preserves history, local fake state, and OpenAI jobs/files. Caller cancellation requests SAA cancellation through Nexus; after `ErrResultPending` there is no active Worker to forward it to the batch queue. The SAA can remain pending until external completion or timeout, and a successful external completion can still win. Shared upstream jobs continue. Stop Workers and the local server with Ctrl-C in their terminals.
+Caller cancellation reaches the SAA through Nexus. After `ErrResultPending`, no active Activity worker remains to remove the request from a shared batch. The SAA can remain pending until external completion or timeout, and successful completion can still win. Other requests in the same provider job continue.
 
-Use `--address` and `--namespace`, or `TEMPORAL_ADDRESS` and `TEMPORAL_NAMESPACE`, for another local service. The setup script uses the same environment variables. This prototype's CLI targets a local development server; production authentication and deployment are outside its scope.
+`cleanup` stops new dispatch for the named Postgres run, cancels its Temporal Workflows, and terminates its remaining SAAs. It retains database records, history, fake-provider state, and provider jobs/files. Stop workers and Temporal with Ctrl-C. `make postgres-stop` stops only the native development cluster; `docker compose down` stops the Compose instance while preserving its named volume.
 
-## Fake failure scenarios
+Use `TEMPORAL_ADDRESS` / `TEMPORAL_NAMESPACE` or CLI connection flags for another local Temporal service. Production authentication and deployment are outside this prototype.
 
-Restart the fake worker with a scenario and use a new demo run ID:
+## Fake and live providers
+
+Fake state persists under `.state/fake`. Supported scenarios are `success`, `mixed`, `expired`, `missing`, `duplicate`, `unknown`, `malformed`, `submission-unknown`, and `submission-unreconciled`. Run one scenario per service queue:
 
 ```sh
 bin/batchctl worker --mode fake --scenario mixed --state-dir .state/fake
 bin/batchctl demo --run-id mixed-001 --count 6 --batch-size 6
 ```
 
-Run one service worker configuration per service queue when injecting scenarios. Supported scenarios are `success`, `mixed`, `expired`, `missing`, `duplicate`, `unknown`, `malformed`, `submission-unknown`, and `submission-unreconciled`.
-
-The fake writes jobs and provider files under its state directory using atomic replacement and process locking. Restarting Workers with the same directory preserves submitted jobs. `submission-unknown` creates a job and loses the response, then allows positive reconciliation. `submission-unreconciled` hides the created job from discovery: callers receive `SUBMISSION_UNKNOWN`, and no replacement is submitted.
-
-To check restart behavior manually, use `--delay 20s`, start a demo, wait until `inspect` shows a provider batch ID, then stop and restart the Worker with the same state directory. The demo should resume the original batch. The integration suite automates this test with a new Worker and provider instance.
-
-## Live OpenAI mode
-
-Export `OPENAI_API_KEY` and `OPENAI_MODEL` in your shell. `.env.example` lists the available environment variables; the program does not load `.env` automatically. No credential is stored in Workflow inputs or provider metadata.
+Live mode submits paid OpenAI requests. Export `OPENAI_API_KEY` and an explicitly chosen `OPENAI_MODEL`, then:
 
 ```sh
-# Register a separate endpoint and start a separate service queue
 make setup MODE=live
 make worker MODE=live
 
-# In another terminal: five short documents, at most 128 generated tokens each
+# In another terminal:
 bin/batchctl demo --mode live --count 5 --run-id live-001
 ```
 
-The model is selected with `OPENAI_MODEL` or `--model`. The service uses `/v1/responses`, uploads JSONL with purpose `batch`, and creates the upstream job with `completion_window: "24h"`. The five-second collection window is independent of that provider processing window. Live polling defaults to 30 seconds; the service result deadline is 25 hours and the Nexus operation timeout is 26 hours. [OpenAI Batch documentation](https://developers.openai.com/api/docs/guides/batch)
+Live jobs use `/v1/responses`, JSONL uploaded with purpose `batch`, and `completion_window: "24h"`. Polling defaults to 30 seconds, the result deadline is 25 hours, and the Nexus operation timeout is 26 hours. Fake and live dispatch are separated by endpoint and mode. [OpenAI Batch guide](https://developers.openai.com/api/docs/guides/batch)
 
-`--wait 2m` limits how long the CLI waits; it does not cancel the durable operations. Unconfirmed operations appear as `pending`, separately from known failures. If the CLI stops waiting, `inspect` can still show the job and the Workers continue processing it. Use `finish` when you are done admitting requests. The upstream job and uploaded files are deliberately retained for inspection; remove them through your provider tooling when no longer needed.
+## Bounds and remaining limits
 
-Fake and live endpoints target different queues, so their providers cannot process each other's batches. Caller Workers share a queue and use the endpoint in each run's configuration.
+Default batches contain at most **100 requests** or **512 KiB** of encoded JSONL, with a five-second collection window. Configurable upper bounds are **50,000 requests** and **200,000,000 bytes** per batch. Input envelopes remain bounded to 8 KiB and normalized results to 4 KiB. Raw provider files are capped at 200 MB. `--max-admissions 0` means no per-run admission cap; a positive value adds an optional database-enforced cap.
 
-## Contract and bounds
+The collection window plus provider result deadline must be less than the operation timeout, leaving time for external completion.
 
-```json
-{"run_id":"demo-001","request_id":"document-042","input":"Summarize this document: ..."}
+This removes batch-size growth from Workflow payloads and per-item completion events from batch histories. Activities still materialize a bounded provider manifest/file in worker memory, and enrollment for one run takes a short Postgres row lock. Production throughput, connection sizing, retention, and partitioning need measurement; a larger configured limit is not a throughput benchmark.
+
+External completion uses the conventional `ErrResultPending` path. Ordinary Activity timeouts span enrollment and external work; separate phase timeout/retry policies are unsupported. Recovery is verified after the database enrollment commits. A worker killed before that commit can leave a single-attempt SAA waiting until its ordinary timeout (two minutes fake, 26 hours live).
+
+```sh
+bin/batchctl capabilities
+bin/batchctl capabilities --require-handoff  # rejects unsupported phase policies
 ```
-
-```json
-{"request_id":"document-042","text":"The document describes ...","usage":{"input_tokens":80,"output_tokens":30}}
-```
-
-The examples are illustrative. `usage` may be null. A failed item fails its own Nexus operation. Machine failure types include invalid input, duplicate identity, run closure/capacity, item failure, expiry, missing/invalid results, deadlines, and submission uncertainty.
-
-Defaults are 100 requests and 512 KiB of encoded JSONL per batch, 8 KiB per input envelope, 4 KiB per normalized result, and 1,000 unique admissions per run. The coordinator validates the actual encoded JSONL length, including line separators, before admitting a record. Request and run identifiers have a bounded character set. The launcher rejects duplicate input IDs before starting any Workflows.
-
-An enrollment retry from the same SAA execution and attempt token returns its existing assignment, even after the buffer has sealed. A separate Nexus operation using the same `(run_id, request_id)` fails as a duplicate. Input fingerprints, Activity IDs, Activity run IDs, and exact attempt tokens protect result correlation. Completion tokens stay in service-side Workflow history and never appear in user-facing reports or logs.
-
-## Architecture and recovery
-
-`CallerWorkflow` makes one Nexus call. A `NewTemporalOperation` handler calls `temporalnexus.StartActivity`, which attaches the Nexus completion callback to the SAA. `SubmitRequest` persists its task token through an acknowledged coordinator Update and returns `ErrResultPending`. The coordinator seals its buffer without yielding and starts an immutable `BatchWorkflow`. The child uploads, submits, polls, and reconciles both result files by `custom_id`. Its `CompleteResult` Activities complete each original SAA with the recorded token. The SAA callback completes the original Nexus operation.
-
-The per-request path uses no `NewWorkflowRunOperation`, waiting Workflow, or result Signal. Shared batching still uses Workflows. Ordinary Workflow Updates acknowledge durable enrollment and close admission. [Go Nexus SDK](https://pkg.go.dev/go.temporal.io/sdk/temporalnexus), [Go external async completion](https://docs.temporal.io/develop/go/activities/asynchronous-activity)
-
-Uploads and batch creation are separate persisted Activity steps. Batch creation has **one attempt**, including at the HTTP layer. If a response is lost, recovery searches provider metadata and checks the uploaded file ID. Exactly one matching job can resume processing. Zero or multiple matches produce `SUBMISSION_UNKNOWN`; absence from listing never authorizes an automatic replacement. Inspect the report's input file ID, logical batch ID, and `run_id`/`logical_batch_id` metadata in OpenAI before taking any manual action. The prototype does not promise exactly-once execution or billing and does not offer an automatic resubmission command.
-
-Unknown and malformed result rows appear in diagnostics. Missing or duplicate results fail the affected requests. Completed items remain successful in partially expired batches. Repeated completion after a lost acknowledgment inspects the exact Activity execution and its recorded outcome; it never falls back to completing the latest attempt by ID. Stale or closed targets are skipped. Shared coordinator progress signals expose provider IDs before completion.
-
-Each request has one SAA, with batching shared across requests. This bounded example does not benchmark 50,000-request batches or run indefinitely. External batching storage, long-running coordinator rotation, production tenancy, and first-class handoff need further implementation and measurement.
 
 ## Verification
 
 ```sh
 make test
-make test-integration   # requires make server; creates isolated endpoints/queues
+make test-store         # real Postgres required
+make test-integration   # real Postgres and Temporal required
 
-# Abrupt process failure check: server and endpoint up, other fake workers STOPPED
+# Abrupt process failure: endpoint/server/Postgres up, other fake workers stopped
 python3 scripts/verify-hardkill.py
 ```
 
-Unit tests cover serialization bounds, admission and sealing, deduplication, cancellation, provider HTTP contracts, persistent fake state, and result reconciliation. Integration tests use a real Temporal server and real Nexus; only OpenAI is faked. They inspect caller histories to ensure the caller made a Nexus operation rather than bypassing it with an Activity.
-
-See [VERIFICATION.md](VERIFICATION.md) for the observed toolchain, results, and limits of the live smoke test.
+The suites cover SQL concurrency and ownership, sealing, dispatch recovery, result reconciliation, exact-token completion, partial delivery recovery, and batch-history payload bounds. See [VERIFICATION.md](VERIFICATION.md) for observed results and their limits.

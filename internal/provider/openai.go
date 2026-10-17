@@ -11,9 +11,11 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/temporal-sa/temporal-nexus-openai-batch/internal/model"
 )
 
-const defaultMaxFileBytes int64 = 16 << 20
+const defaultMaxFileBytes int64 = model.HardMaxBatchBytes
 const maxControlBytes int64 = 1 << 20
 const maxListPages = 1000
 
