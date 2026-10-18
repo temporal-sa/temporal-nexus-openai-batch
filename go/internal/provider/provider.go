@@ -1,4 +1,7 @@
 // Package provider isolates OpenAI Batch API I/O from durable orchestration.
+// Live and fake implementations share the same upload/create/poll/download
+// contract; Temporal Activities decide when those calls run and PostgreSQL
+// preserves their manifests and normalized outcomes.
 package provider
 
 import (
@@ -8,7 +11,9 @@ import (
 )
 
 // Provider methods make one attempt. In particular Create must never retry an
-// uncertain submission: the caller must reconcile it using Find first.
+// uncertain submission: the caller must reconcile it using Find first. Metadata
+// helps locate an accepted job after a lost response; it is not a provider-side
+// idempotency guarantee. Even an empty search must not trigger a blind resubmit.
 type Provider interface {
 	Upload(context.Context, string, []byte) (string, error)
 	Create(context.Context, string, map[string]string) (Job, error)
@@ -17,6 +22,9 @@ type Provider interface {
 	Results(context.Context, Job) ([]byte, []byte, error)
 }
 
+// Job contains only the control information needed to resume processing. Input
+// documents and result-file contents are passed separately and stay out of the
+// batch Workflow's control state.
 type Job struct {
 	ID           string            `json:"id"`
 	Status       string            `json:"status"`
@@ -26,6 +34,9 @@ type Job struct {
 	Metadata     map[string]string `json:"metadata,omitempty"`
 }
 
+// Terminal includes failed, expired, and cancelled jobs because their available
+// files may still resolve some requests. Reconciliation supplies a failure for
+// every manifest request those files leave unresolved.
 func (j Job) Terminal() bool {
 	switch j.Status {
 	case "completed", "failed", "expired", "cancelled":
@@ -37,6 +48,8 @@ func (j Job) Terminal() bool {
 
 // Error contains safe diagnostic information without response bodies, request
 // inputs or credentials. Ambiguous means Create may have reached the provider.
+// Permanent describes retryability of the reported error; it does not turn an
+// ambiguous paid submission into a safe operation to repeat.
 type Error struct {
 	Op        string
 	Code      string

@@ -12,9 +12,36 @@ This repository contains equivalent Go and Python implementations. Both currentl
 | `python/` | Python application, tests and [run instructions](python/README.md) |
 | `scripts/` | Shared PostgreSQL and Temporal development services |
 | `samples` | Three example documents |
+| `docs/architecture.md` | Request walkthrough, state ownership and code reading guide |
 | `docs/testing.md` | Test commands and coverage |
 
 ## How batching works
+
+```mermaid
+flowchart TD
+    Caller["Caller Workflow<br/>one logical request"]
+    SAA["Nexus service: llm-batch.respond<br/>backed by a Standalone Activity"]
+    Store[("PostgreSQL<br/>requests, manifests, tokens, outcomes, outboxes")]
+    Dispatch["Dispatcher<br/>worker background loop"]
+    Batch["Batch Workflow<br/>one sealed batch, small references"]
+    Activities["Batch Activities<br/>upload → create → poll → results → deliver"]
+    OpenAI["OpenAI<br/>Files and Batch APIs"]
+    Keeper["Keeper<br/>heartbeats and completion recovery"]
+
+    Caller -->|"Nexus operation"| SAA
+    SAA -->|"enroll, then release worker slot"| Store
+    Store -->|"sealed batch outbox"| Dispatch
+    Dispatch -->|"start with stable Workflow ID"| Batch
+    Batch -->|"schedule Activities"| Activities
+    Activities <-->|"JSONL upload, job status, result files"| OpenAI
+    Activities <-->|"load manifest; save outcomes and checkpoints"| Store
+    Store -->|"pending targets and outcomes"| Keeper
+    Keeper -->|"heartbeat or complete exact Activity attempt"| SAA
+    Activities -->|"external completion with stored token"| SAA
+    SAA -.->|"Temporal delivers Nexus result or failure"| Caller
+```
+
+Temporal persists the caller, the Standalone Activity and the batch Workflow. Application workers execute the Nexus handler, Activities, dispatcher and keeper. The diagram describes either implementation; Go and Python use separate queues and databases.
 
 PostgreSQL owns request bodies, batch membership, fingerprints, exact Activity attempt tokens, outcomes and delivery checkpoints. Batch Workflow histories contain a small reference, provider identifiers and aggregate reports. Each caller retains its own request and result in its history.
 
@@ -25,6 +52,8 @@ An independent keeper heartbeats enrolled Activities after they release their wo
 Upload and batch creation are separate Activities. Creation has **one Activity attempt and one HTTP attempt**. An uncertain submission is looked up using metadata and the input file ID. Zero or multiple matches produce `SUBMISSION_UNKNOWN`, without another creation call. This favors avoiding duplicate provider jobs; exactly-once billing is not guaranteed.
 
 Provider work uses an absolute deadline capped by the earliest recipient deadline, retaining time for delivery. One heartbeat-enabled polling Activity keeps polling iterations out of Workflow history. Result storage and final bookkeeping continue retrying after recipients expire.
+
+See the [architecture and code reading guide](docs/architecture.md) for a request walkthrough, the recovery rules and matching Go/Python entry points.
 
 ## Run the Go application
 
@@ -82,7 +111,7 @@ bin/batchctl cancel --run-id sample-001 --request-id library
 bin/batchctl cleanup --run-id sample-001
 ```
 
-`finish` closes admission and seals a partial batch. `cancel` cancels one caller; detached Activities can remain pending until completion or timeout, and other batch members continue. `cleanup` stops admission and submission, cancels recorded batch Workflows and terminates their Activities. It retains database records, history and provider files. A provider job accepted before cleanup can continue running.
+`finish` closes admission and seals a partial batch. `cancel` cancels one caller; detached Activities can remain pending until completion or timeout, and other batch members continue. `cleanup` stops admission and submission, cancels recorded batch Workflows and terminates the run's enrolled Standalone Activities. It retains database records, history and provider files. A provider job accepted before cleanup can continue running.
 
 Stop workers and Temporal with Ctrl-C. `make postgres-stop` stops the native development cluster. `docker compose down` preserves the database volume.
 

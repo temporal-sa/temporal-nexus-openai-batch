@@ -1,4 +1,10 @@
-// Package orchestration owns durable batching and the public Nexus operation.
+// Package orchestration connects a per-request Nexus operation to shared provider
+// batches. PostgreSQL owns admission, batch membership, completion credentials and
+// outcomes; BatchWorkflow sequences the provider work using small references.
+//
+// Workflow code uses Temporal's deterministic APIs so its decisions can replay.
+// HTTP, SQL and Temporal client RPCs live in Activities or the dispatcher/keeper,
+// which run as ordinary worker-process code and recover through durable records.
 package orchestration
 
 import (
@@ -23,11 +29,16 @@ import (
 
 // RequestActivityID preserves Nexus start idempotency while keeping independent
 // operations distinct, so duplicate logical request IDs can be rejected.
+// The Nexus request ID identifies retries of one operation start. A second
+// operation using the same logical request_id gets a different Activity ID and
+// must pass the store's ownership checks instead of silently sharing a result.
 func RequestActivityID(r model.Request, nexusRequestID string) string {
 	h := sha256.Sum256([]byte(r.RunID + "\x00" + r.RequestID + "\x00" + nexusRequestID))
 	return "request-activity/" + r.RunID + "/" + hex.EncodeToString(h[:])
 }
 
+// RegisterBatch separates bulk work from short admission Activities. Each batch
+// runs a fixed sequence of coarse Activities rather than one Activity per item.
 func RegisterBatch(w worker.Worker, c client.Client, p provider.Provider, repo Repository) {
 	w.RegisterWorkflow(BatchWorkflow)
 	activities := &ServiceActivities{Client: c, Provider: p, Store: repo}
@@ -39,6 +50,10 @@ func RegisterBatch(w worker.Worker, c client.Client, p provider.Provider, repo R
 	}
 }
 
+// RegisterService exposes respond as a Temporal-backed asynchronous Nexus
+// operation. Its backing execution is a standalone Activity (SAA), not a Workflow
+// that waits for a later signal. The SDK carries the Nexus callback onto that
+// Activity, so external completion ultimately resolves the caller's operation.
 func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo Repository) {
 	activities := &ServiceActivities{Client: c, Provider: p, Store: repo}
 	w.RegisterActivity(activities.SubmitRequest)
@@ -48,6 +63,9 @@ func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo
 			if err := model.ValidateRequest(input); err != nil {
 				return temporalnexus.TemporalOperationResult[model.Result]{}, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "%s", err)
 			}
+			// Read the authoritative run configuration at ingress. The endpoint
+			// check keeps a fake/live operation from entering a run owned by a
+			// different service endpoint even if its run ID is known.
 			run, err := repo.GetRun(ctx, input.RunID)
 			if err != nil {
 				return temporalnexus.TemporalOperationResult[model.Result]{}, configurationLookupError(err)
@@ -60,6 +78,9 @@ func RegisterService(w worker.Worker, c client.Client, p provider.Provider, repo
 				return temporalnexus.TemporalOperationResult[model.Result]{}, err
 			}
 			activityID := RequestActivityID(input, opts.RequestID)
+			// Starting the SAA returns an asynchronous operation handle promptly.
+			// The long operation timeout includes collection and provider waiting;
+			// the shorter heartbeat timeout detects lost enrollment/keeper work.
 			result, err := temporalnexus.StartActivity(ctx, nc, client.StartActivityOptions{
 				ID:                     activityID,
 				StartToCloseTimeout:    config.OperationTimeout,
@@ -114,6 +135,10 @@ func RegisterCaller(w worker.Worker) { w.RegisterWorkflow(CallerWorkflow) }
 
 // CallerWorkflow performs one logical operation. All provider files, batches,
 // polling and result fan-out remain behind the Nexus boundary.
+// It is an example consumer: a real business Workflow can make this same Nexus
+// call directly. Waiting on the future persists the wait in Temporal; it does
+// not reserve a worker thread for the provider's processing window. This
+// per-request history still contains its own bounded request and result.
 func CallerWorkflow(ctx workflow.Context, input model.CallerInput) (model.Result, error) {
 	if err := model.ValidateRequest(input.Request); err != nil {
 		return model.Result{}, typedFailure(err)
@@ -121,6 +146,8 @@ func CallerWorkflow(ctx workflow.Context, input model.CallerInput) (model.Result
 	if err := input.Config.Validate(); err != nil {
 		return model.Result{}, failure("INVALID_INPUT", err.Error())
 	}
+	// WaitRequested waits for the cancellation request to be acknowledged. It
+	// does not mean the caller waits for the shared upstream batch to terminate.
 	f := workflow.NewNexusClient(input.Config.Endpoint, model.Service).ExecuteOperation(ctx,
 		model.Operation, input.Request, workflow.NexusOperationOptions{ScheduleToCloseTimeout: input.Config.OperationTimeout,
 			CancellationType: workflow.NexusOperationCancellationTypeWaitRequested})
@@ -129,6 +156,9 @@ func CallerWorkflow(ctx workflow.Context, input model.CallerInput) (model.Result
 	return result, err
 }
 
+// failure marks a known business/validation failure as non-retryable. Retrying
+// unchanged invalid input cannot repair it; transient infrastructure errors are
+// left as ordinary errors so the surrounding Temporal policy can retry them.
 func failure(code, message string, details ...any) error {
 	return temporal.NewNonRetryableApplicationError(message, code, nil, details...)
 }
@@ -147,15 +177,22 @@ func errorType(err error) string {
 	return ""
 }
 
-// ServiceActivities contains the only network calls made by service workflows.
+// serviceActivities supplies method references when scheduling Activities. The
+// Workflow does not dereference this nil pointer or call its methods locally;
+// RegisterBatch registers methods on a real instance with I/O dependencies.
 var serviceActivities *ServiceActivities
 
+// ServiceActivities is the I/O boundary used by BatchWorkflow and the SAA.
+// Dependencies are worker-local objects and are never serialized into history.
 type ServiceActivities struct {
 	Client   client.Client
 	Provider provider.Provider
 	Store    Repository
 }
 
+// Enroll is a direct repository call inside SubmitRequest, not a separately
+// scheduled Workflow Activity. Admission and its exact completion target commit
+// together before SubmitRequest gives up its execution slot.
 func (a *ServiceActivities) Enroll(ctx context.Context, e model.Enrollment) (model.Admission, error) {
 	admission, err := a.Store.Enroll(ctx, e)
 	return admission, typedFailure(err)
@@ -168,6 +205,9 @@ func providerError(err error) error {
 	return err
 }
 
+// Upload materializes the sealed manifest only inside this Activity. The
+// Workflow receives a file ID, so batch-sized JSONL never becomes its payload.
+// Repeating an upload can leave another input file, but does not execute a batch.
 func (a *ServiceActivities) Upload(ctx context.Context, ref model.BatchRef) (string, error) {
 	m, err := a.Store.LoadManifest(ctx, ref.BatchID)
 	if err != nil {
@@ -181,6 +221,8 @@ func (a *ServiceActivities) Upload(ctx context.Context, ref model.BatchRef) (str
 	return id, providerError(err)
 }
 
+// CreateResult distinguishes a confirmed provider rejection from an ambiguous
+// send. Ambiguity means a paid job may exist even though its ID was not received.
 type CreateResult struct {
 	Job         provider.Job
 	Failure     string
@@ -193,6 +235,9 @@ type CreateResult struct {
 func (a *ServiceActivities) Create(ctx context.Context, ref model.BatchRef, fileID string) (CreateResult, error) {
 	var result CreateResult
 	called := false
+	// The store's run lock orders submission against explicit run cleanup. It
+	// cannot make an HTTP request atomic with SQL: a lost acknowledgment still
+	// requires lookup, rather than assuming the provider did not accept work.
 	err := a.Store.WithSubmission(ctx, ref.BatchID, func(callCtx context.Context) error {
 		called = true
 		job, providerErr := a.Provider.Create(callCtx, fileID, batchMetadata(ref))
@@ -215,6 +260,9 @@ func (a *ServiceActivities) Create(ctx context.Context, ref model.BatchRef, file
 	return result, nil
 }
 
+// Find reconciles an uncertain Create by both logical-batch metadata and input
+// file ID. Only one exact match is safe to adopt; zero or multiple matches leave
+// the submission unknown and must not trigger another paid Create.
 func (a *ServiceActivities) Find(ctx context.Context, ref model.BatchRef, fileID string) (CreateResult, error) {
 	jobs, err := a.Provider.Find(ctx, batchMetadata(ref))
 	if err != nil {
@@ -252,12 +300,17 @@ func (a *ServiceActivities) Results(ctx context.Context, ref model.BatchRef, job
 		return model.DeliverySummary{}, providerError(err)
 	}
 	outcomes, diagnostics := provider.Reconcile(manifest, job, output, errorFile)
+	// Commit outcomes before any external completion. Delivery can then retry
+	// from PostgreSQL after a crash without depending on downloading files again.
 	if err := a.Store.SaveOutcomes(ctx, ref.BatchID, outcomes, diagnostics); err != nil {
 		return model.DeliverySummary{}, err
 	}
 	return a.Store.DeliverySummary(ctx, ref.BatchID)
 }
 
+// FailBatch turns a batch-level failure into stored per-request outcomes. Those
+// failures use the same delivery path as successful provider results, allowing
+// each original Nexus caller to receive its own terminal failure.
 func (a *ServiceActivities) FailBatch(ctx context.Context, ref model.BatchRef, code, message string) (model.DeliverySummary, error) {
 	if err := a.Store.FailBatch(ctx, ref.BatchID, code, message); err != nil {
 		return model.DeliverySummary{}, err

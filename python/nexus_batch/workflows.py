@@ -1,4 +1,11 @@
-"""Durable control flow. Request bodies, manifests and tokens stay out of batch history."""
+"""Durable control flow, separate from provider I/O and bulk request storage.
+
+Temporal replays Workflow code from recorded events after a worker restarts.
+These Workflows therefore use ``workflow.now()`` and Activities rather than doing
+HTTP, PostgreSQL, or ordinary wall-clock I/O themselves. The batch Workflow keeps
+small references, provider IDs, and aggregate reports; its manifest, documents,
+completion tokens, and individual outcomes stay in PostgreSQL.
+"""
 
 from datetime import timedelta
 
@@ -7,6 +14,8 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    # These modules define the shared types also used by Activity workers. Their
+    # imports pass through the sandbox; their I/O functions still run in Activities.
     from .activities import CreateResult
     from .models import BatchRef, BatchReport, CallerInput, DeliverySummary, Result, SERVICE, OPERATION
     from .provider import Job
@@ -21,6 +30,11 @@ def finalization_options(bulk: bool = False) -> dict:
 
 
 def provider_deadline(ref: BatchRef):
+    """Leave delivery time before the earliest enrolled Activity expires.
+
+    Collection time consumes some of the caller's overall operation budget. A
+    retry must reuse this sealed reference, not move the absolute deadline ahead.
+    """
     reserve = ref.config.operation_timeout - ref.config.result_deadline - ref.config.window
     return min(
         ref.sealed_at + timedelta(seconds=ref.config.result_deadline),
@@ -29,6 +43,8 @@ def provider_deadline(ref: BatchRef):
 
 
 def provider_options(deadline, *, create: bool = False, bulk: bool = False) -> dict:
+    # schedule_to_close covers queueing and all retries, so an unavailable worker
+    # cannot turn the finite provider budget into an indefinitely pending request.
     remaining = max(timedelta(milliseconds=1), deadline - workflow.now())
     return {
         "start_to_close_timeout": min(timedelta(seconds=300 if bulk else 30), remaining),
@@ -43,6 +59,13 @@ def provider_options(deadline, *, create: bool = False, bulk: bool = False) -> d
 
 @workflow.defn
 class CallerWorkflow:
+    """Example consumer: durably await one Nexus operation for one document.
+
+    An application's own business Workflow can make this same call directly.
+    This example does not collect the batch; PostgreSQL does that across callers.
+    The individual caller history contains its own request and result.
+    """
+
     @workflow.run
     async def run(self, input: CallerInput) -> Result:
         client = workflow.create_nexus_client(service=SERVICE, endpoint=input.config.nexus_endpoint)
@@ -57,6 +80,12 @@ class CallerWorkflow:
 
 @workflow.defn
 class BatchWorkflow:
+    """Orchestrate one sealed external manifest through submission and delivery.
+
+    Each Activity reloads bulk data by batch ID. Returning only summaries keeps
+    history size independent of document sizes and individual delivery details.
+    """
+
     def __init__(self):
         self.report = BatchReport(batch_id="", status="starting")
 
@@ -75,6 +104,8 @@ class BatchWorkflow:
         report.diagnostics = list(dict.fromkeys(report.diagnostics + summary.diagnostics))[:100]
 
     async def fail(self, ref: BatchRef, code: str, message: str) -> None:
+        # A provider-level failure still needs one persisted outcome per request,
+        # followed by the same delivery path used for successful provider results.
         summary = await workflow.execute_activity(
             "fail_batch", args=[ref, code, message], result_type=DeliverySummary, **finalization_options()
         )
@@ -122,6 +153,11 @@ class BatchWorkflow:
         return self.report
 
     async def process(self, ref: BatchRef, deadline) -> None:
+        """Resolve provider uncertainty into durable per-request outcomes.
+
+        This method prepares outcomes in the store; ``run`` subsequently delivers
+        them even when upload, submission, polling, or result download failed.
+        """
         if workflow.now() >= deadline:
             await self.fail(ref, "DEADLINE_EXCEEDED", "provider deadline reached before upload")
             return
@@ -147,6 +183,8 @@ class BatchWorkflow:
         except ActivityError:
             created = CreateResult(ambiguous=True)
         if created.ambiguous:
+            # A timeout does not prove that OpenAI rejected the paid submission.
+            # Search by our metadata and input file; never POST a replacement job.
             self.report.status = "reconciling_submission"
             try:
                 created = await workflow.execute_activity(
@@ -182,6 +220,8 @@ class BatchWorkflow:
                 return
             remaining = deadline - workflow.now()
             try:
+                # Polling is one heartbeating Activity, not a Workflow event for
+                # every HTTP poll. Its retries remain inside the same deadline.
                 job = await workflow.execute_activity(
                     "poll",
                     args=[job, deadline, ref.config.poll_interval],

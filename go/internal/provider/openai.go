@@ -15,10 +15,14 @@ import (
 	"github.com/temporal-sa/temporal-nexus-openai-batch/go/internal/model"
 )
 
+// Control responses and bulk files have separate caps. A short batch-status
+// response should never consume the memory budget reserved for JSONL files.
 const defaultMaxFileBytes int64 = model.HardMaxBatchBytes
 const maxControlBytes int64 = 1 << 20
 const maxListPages = 1000
 
+// OpenAIConfig permits an injected HTTP client and base URL for local tests.
+// The live key is retained only by the provider, never placed in Job or errors.
 type OpenAIConfig struct {
 	APIKey       string
 	BaseURL      string
@@ -55,6 +59,10 @@ func NewOpenAI(cfg OpenAIConfig) (*OpenAI, error) {
 	return &OpenAI{key: cfg.APIKey, baseURL: strings.TrimRight(cfg.BaseURL, "/"), client: &client, maxFileBytes: cfg.MaxFileBytes}, nil
 }
 
+// Upload stores a complete JSONL file with OpenAI's batch purpose. Uploading a
+// file does not schedule model inference; Create is the paid job boundary.
+// logicalBatchID is part of the shared interface, but live correlation is carried
+// by the batch metadata rather than by the uploaded file name.
 func (p *OpenAI) Upload(ctx context.Context, logicalBatchID string, data []byte) (string, error) {
 	if len(data) == 0 || int64(len(data)) > p.maxFileBytes {
 		return "", &Error{Op: "upload", Code: "input_size", Message: "input file is empty or exceeds configured size limit", Permanent: true}
@@ -88,6 +96,9 @@ func (p *OpenAI) Upload(ctx context.Context, logicalBatchID string, data []byte)
 	return file.ID, nil
 }
 
+// Create schedules one Responses batch using the previously uploaded file.
+// Unlike read-only polling, an uncertain result cannot be retried safely: the
+// first call may already have scheduled all of the requests for billing.
 func (p *OpenAI) Create(ctx context.Context, fileID string, metadata map[string]string) (Job, error) {
 	if fileID == "" {
 		return Job{}, &Error{Op: "create", Code: "input_file_missing", Message: "input file ID is required", Permanent: true}
@@ -108,6 +119,8 @@ func (p *OpenAI) Create(ctx context.Context, fileID string, metadata map[string]
 	return decodeJob(response, "create", true)
 }
 
+// Retrieve performs one status read. The polling Activity owns delays,
+// heartbeats, retries, and deadlines, keeping orchestration outside the client.
 func (p *OpenAI) Retrieve(ctx context.Context, batchID string) (Job, error) {
 	response, err := p.request(ctx, "retrieve", http.MethodGet, "/batches/"+url.PathEscape(batchID), "", nil, maxControlBytes, false)
 	if err != nil {
@@ -118,6 +131,7 @@ func (p *OpenAI) Retrieve(ctx context.Context, batchID string) (Job, error) {
 
 // Find scans every list page. OpenAI's list operation has no server-side metadata
 // filter, so stopping after a page could incorrectly declare a submission absent.
+// Pagination failures remain errors rather than a misleading empty match set.
 func (p *OpenAI) Find(ctx context.Context, metadata map[string]string) ([]Job, error) {
 	var found []Job
 	seen := map[string]bool{}
@@ -162,6 +176,9 @@ func (p *OpenAI) Find(ctx context.Context, metadata map[string]string) ([]Job, e
 	return nil, &Error{Op: "find", Code: "pagination_limit", Message: "provider batch listing exceeded 1000 pages; submission absence cannot be established", Permanent: true}
 }
 
+// Results downloads both files from a terminal job. Successful and failed
+// requests can be split between them; the manifest, not either file alone,
+// defines the complete set of requests Reconcile must resolve.
 func (p *OpenAI) Results(ctx context.Context, job Job) ([]byte, []byte, error) {
 	output, err := p.fileContent(ctx, job.OutputFileID)
 	if err != nil {
@@ -176,11 +193,17 @@ func (p *OpenAI) Results(ctx context.Context, job Job) ([]byte, []byte, error) {
 
 func (p *OpenAI) fileContent(ctx context.Context, id string) ([]byte, error) {
 	if id == "" {
+		// Some terminal jobs have no output file, no error file, or neither.
+		// Missing files are empty inputs to reconciliation, not missing requests.
 		return nil, nil
 	}
 	return p.request(ctx, "results", http.MethodGet, "/files/"+url.PathEscape(id)+"/content", "", nil, p.maxFileBytes, false)
 }
 
+// request performs a single HTTP exchange and returns sanitized error categories.
+// submission marks the Create boundary: transport loss, unreadable success, or
+// a server error cannot prove that the remote paid side effect did not happen.
+// There is no application retry loop here; callers choose recovery by operation.
 func (p *OpenAI) request(ctx context.Context, op, method, path, contentType string, body io.Reader, maxBytes int64, submission bool) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, p.baseURL+path, body)
 	if err != nil {
@@ -195,6 +218,8 @@ func (p *OpenAI) request(ctx context.Context, op, method, path, contentType stri
 		return nil, &Error{Op: op, Code: "transport_error", Message: "provider request did not return a response", Ambiguous: submission}
 	}
 	defer resp.Body.Close()
+	// Reading one extra byte distinguishes a response at the cap from one that
+	// was truncated by the reader. Raw bodies are never copied into errors.
 	data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		permanent := resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != 408 && resp.StatusCode != 409 && resp.StatusCode != 429

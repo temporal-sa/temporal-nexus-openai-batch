@@ -1,4 +1,9 @@
-"""The public Nexus operation is backed by a real Standalone Activity."""
+"""Turn a Nexus call into a real Temporal Standalone Activity (SAA).
+
+The handler starts an Activity and returns Temporal's operation handle. The
+Activity enrolls the request in PostgreSQL, then hands completion to the batch
+delivery path. There is no long-lived in-memory Nexus handler waiting on OpenAI.
+"""
 
 import hashlib
 from datetime import timedelta
@@ -24,6 +29,8 @@ from .store import Store
 
 @handler.service_handler(name=SERVICE)
 class BatchService:
+    """Nexus admission boundary; run configuration is owned by the external store."""
+
     def __init__(self, store: Store, endpoint: str):
         self.store, self.endpoint = store, endpoint
 
@@ -43,6 +50,8 @@ class BatchService:
         except (Failure, ValueError) as exc:
             raise nexusrpc.HandlerError(str(exc), type=nexusrpc.HandlerErrorType.BAD_REQUEST) from exc
         except Exception as exc:
+            # A temporary database outage is retryable admission failure, rather
+            # than a reason to accept a request without its persisted configuration.
             raise nexusrpc.HandlerError(
                 "batching run configuration temporarily unavailable",
                 type=nexusrpc.HandlerErrorType.UNAVAILABLE,
@@ -51,6 +60,9 @@ class BatchService:
         identity = hashlib.sha256(
             f"{input.run_id}\0{input.request_id}\0{ctx.request_id}".encode()
         ).hexdigest()
+        # Include the Nexus request identity: retries of this operation start the
+        # same SAA, while a separate operation cannot silently steal its request ID.
+        # REJECT_DUPLICATE also prevents reuse after that Activity execution closes.
         return await client.start_activity(
             Activities.submit_request,
             SAAInput(input, run.config),

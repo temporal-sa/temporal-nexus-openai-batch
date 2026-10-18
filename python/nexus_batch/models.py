@@ -1,7 +1,9 @@
 """Small orchestration references and the data kept in PostgreSQL.
 
-Durations are seconds. Documents, completion tokens and per-request outcomes
-belong in the store; only ``BatchRef`` travels through batch Workflow history.
+All duration fields are seconds, including serialized configuration and report
+timings. Documents, completion tokens, and per-request outcomes belong in the
+store; batch Workflow history carries references and aggregate control records.
+The individual caller Workflow still records its own request and bounded result.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ CALLER_TASK_QUEUE = "nexus-batch-python-callers"
 SERVICE_TASK_QUEUE = "nexus-batch-python-service"
 NEXUS_ENDPOINT = "llm-batch-python"
 STATUS_QUERY = "status"
+# The per-operation envelopes stay deliberately small even though the external
+# manifest can grow to the provider's batch limit. Byte limits count UTF-8 bytes.
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_RESULT_BYTES = 4 * 1024
 HARD_MAX_BATCH_REQUESTS = 50_000
@@ -32,6 +36,8 @@ ENROLLMENT_HEARTBEAT = 30.0
 
 @dataclass
 class Request:
+    """Application input; request_id becomes the provider JSONL custom_id."""
+
     run_id: str
     request_id: str
     input: str
@@ -65,6 +71,8 @@ class Failure(Exception):
 
 @dataclass
 class Outcome:
+    """One terminal result or failure tied to a particular admitted request body."""
+
     request_id: str
     fingerprint: str
     batch_id: str
@@ -74,6 +82,13 @@ class Outcome:
 
 @dataclass
 class Config:
+    """An immutable run snapshot once written to PostgreSQL.
+
+    ``window`` controls collection, ``result_deadline`` bounds provider waiting,
+    and ``operation_timeout`` bounds the end-to-end Nexus/SAA execution. Extra
+    operation time leaves room to deliver a deadline failure back to the caller.
+    """
+
     model: str = "fake-model"
     mode: str = "fake"
     window: float = 5.0
@@ -88,6 +103,8 @@ class Config:
 
     @classmethod
     def defaults(cls, mode: str = "fake") -> Config:
+        # Live requests need a deliberate model selection and enough time for
+        # OpenAI's 24-hour processing window plus collection and result delivery.
         if mode == "live":
             return cls(
                 mode=mode,
@@ -124,6 +141,12 @@ class Config:
 
 @dataclass
 class CompletionTarget:
+    """Exact Temporal SAA execution and attempt that owns external completion.
+
+    A task token is an opaque completion capability, not a request identifier.
+    Keep it in PostgreSQL and out of batch Workflow payloads and log messages.
+    """
+
     namespace: str
     activity_id: str
     activity_run_id: str
@@ -133,6 +156,8 @@ class CompletionTarget:
 
 @dataclass
 class Enrollment:
+    """Admission record with the original execution's absolute completion deadline."""
+
     request: Request
     completion_target: CompletionTarget
     fingerprint: str
@@ -156,6 +181,8 @@ class Entry:
 
 @dataclass
 class Manifest:
+    """Sealed batch membership loaded only in Activities, never as Workflow input."""
+
     run_id: str
     batch_id: str
     config: Config
@@ -166,6 +193,12 @@ class Manifest:
 
 @dataclass
 class BatchRef:
+    """Small Workflow input identifying an already sealed external batch.
+
+    Counts, byte size, and timestamps support orchestration without copying the
+    manifest into Temporal history. The earliest recipient deadline bounds work.
+    """
+
     run_id: str
     batch_id: str
     config: Config
@@ -193,6 +226,8 @@ class BatchDelivery:
 
 @dataclass
 class DeliverySummary:
+    """Bounded aggregate handed back from an Activity to the batch Workflow."""
+
     delivered: int = 0
     skipped: int = 0
     succeeded: int = 0
@@ -203,6 +238,12 @@ class DeliverySummary:
 
 @dataclass
 class BatchReport:
+    """Orchestration milestones; provider_status updates at Activity boundaries.
+
+    A long-running poll Activity can be checking a newer OpenAI state while this
+    saved report still shows the state returned by the previous Activity.
+    """
+
     batch_id: str
     provider_batch_id: str = ""
     input_file_id: str = ""
@@ -252,6 +293,8 @@ class SAAInput:
 
 
 def _json_value(value: Any) -> Any:
+    # Store JSON has explicit UTC timestamps and base64 tokens so round trips do
+    # not depend on a database driver's implicit dataclass or bytes conversion.
     if is_dataclass(value):
         return {item.name: _json_value(getattr(value, item.name)) for item in fields(value)}
     if isinstance(value, datetime):
@@ -268,6 +311,7 @@ def _json_value(value: Any) -> Any:
 
 
 def dumps(value: Any) -> str:
+    """Use a stable compact representation for fingerprints and size accounting."""
     return json.dumps(_json_value(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
@@ -275,6 +319,7 @@ T = TypeVar("T")
 
 
 def _decode(cls: Any, value: Any) -> Any:
+    """Restore the shared dataclasses from PostgreSQL's JSON representation."""
     if value is None:
         return None
     origin, args = get_origin(cls), get_args(cls)
@@ -319,6 +364,8 @@ _VALID_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
 
 
 def validate_request(request: Request) -> None:
+    # Validate the entire serialized envelope, rather than just document length;
+    # this bounds the payload actually supplied to Nexus and the SAA.
     if not _VALID_ID.fullmatch(request.run_id) or not _VALID_ID.fullmatch(request.request_id):
         raise Failure(
             "INVALID_INPUT",
@@ -331,10 +378,12 @@ def validate_request(request: Request) -> None:
 
 
 def fingerprint(request: Request) -> str:
+    """Detect reuse of a logical request ID with changed request content."""
     return hashlib.sha256(dumps(request).encode()).hexdigest()
 
 
 def workflow_id(batch_id: str) -> str:
+    # Stable IDs let the dispatch outbox retry an uncertain Workflow start.
     return "batch/" + batch_id
 
 
@@ -343,6 +392,12 @@ def caller_id(run_id: str, request_id: str) -> str:
 
 
 def jsonl_line(request: Request, config: Config) -> bytes:
+    """Encode one independent Responses request in OpenAI Batch JSONL format.
+
+    custom_id is the join key because output lines can arrive in another order.
+    ``store: False`` is part of the Responses request; the application still
+    persists its own admitted document and normalized outcome in PostgreSQL.
+    """
     return (
         dumps(
             {
@@ -362,6 +417,8 @@ def jsonl_line(request: Request, config: Config) -> bytes:
 
 
 def jsonl(manifest: Manifest) -> bytes:
+    # Recheck limits when reading a sealed manifest as well as during admission.
+    # This is the actual uploaded JSONL size, not the larger database JSON size.
     data = b"".join(jsonl_line(entry.request, manifest.config) for entry in manifest.entries)
     if (
         not (1 <= len(manifest.entries) <= manifest.config.max_batch_requests)

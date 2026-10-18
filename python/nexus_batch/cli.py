@@ -1,4 +1,9 @@
-"""Small local CLI for fake or live batches. Durations and reports use seconds."""
+"""Local commands for setup, worker hosting, and the example caller Workflows.
+
+This CLI is a demo driver, not the batching service's durable owner. A demo's
+local wait can end while Temporal and the workers continue processing its run.
+Duration flags and serialized configuration/report timings all use seconds.
+"""
 
 import argparse
 import asyncio
@@ -26,7 +31,12 @@ from .workflows import CallerWorkflow
 
 
 def load_environment(path: Path | None = None) -> None:
-    """Load the repository's .env without replacing exported environment values."""
+    """Load repository .env defaults without replacing exported environment values.
+
+    main calls this before constructing argparse defaults. Precedence is explicit
+    CLI flags, then exported environment, then .env, then built-in defaults.
+    The API key is consumed by live workers, never serialized into run config.
+    """
     load_dotenv(path or Path(__file__).resolve().parents[2] / ".env", override=False)
 
 
@@ -52,6 +62,7 @@ async def initialize_database(dsn: str) -> None:
 
 
 async def setup(client: Client, mode: str) -> None:
+    """Register the Nexus endpoint that routes operations to the SAA worker queue."""
     _, queue, _, endpoint = queues(mode)
     response = await client.operator_service.list_nexus_endpoints(ListNexusEndpointsRequest(name=endpoint))
     if response.endpoints:
@@ -76,6 +87,7 @@ async def setup(client: Client, mode: str) -> None:
 
 
 def configuration(args) -> Config:
+    """Build and validate a run snapshot; workers later read it from PostgreSQL."""
     config = Config.defaults(args.mode)
     config.nexus_endpoint = queues(args.mode)[3]
     config.model = args.model or (os.environ.get("OPENAI_MODEL", "") if args.mode == "live" else config.model)
@@ -99,6 +111,11 @@ def configuration(args) -> Config:
 
 
 async def demo(client: Client, store: Store, args) -> int:
+    """Start independent example consumers, then observe their durable results.
+
+    Client-side launch concurrency is limited for the local demo. Batch size and
+    collection windows are enforced by store admission, not by this launcher.
+    """
     config = configuration(args)
     run_id = args.run_id
     if args.input:
@@ -145,6 +162,8 @@ async def demo(client: Client, store: Store, args) -> int:
         async with asyncio.timeout(args.wait):
             results = await pending
     except TimeoutError:
+        # Stopping this local wait does not cancel the remote Workflows or SAAs.
+        # inspect can report their persisted progress after this process exits.
         print(
             dumps(
                 {
@@ -171,6 +190,11 @@ async def demo(client: Client, store: Store, args) -> int:
 
 
 async def cleanup(client: Client, store: Store, run_id: str) -> None:
+    """Fence future local work before cancelling the run's Temporal resources.
+
+    This command does not cancel an already accepted provider job. It stops the
+    local handoffs, terminates enrolled SAAs, and cancels running demo callers.
+    """
     await store.stop_run(run_id)
     batches, targets = await store.run_resources(run_id)
     errors = []
@@ -240,6 +264,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 async def run(args) -> int:
+    # Fail on missing live credentials/model before opening database or Temporal
+    # connections. Worker model selection belongs to each persisted run config.
     if args.command == "worker" and args.mode == "live" and not os.getenv("OPENAI_API_KEY", "").strip():
         raise ValueError("Set OPENAI_API_KEY in .env before starting a live worker")
     if args.command == "demo":
@@ -297,6 +323,8 @@ async def run(args) -> int:
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     try:
+        # Loading before parser() is essential: argparse's environment-derived
+        # defaults are evaluated when the parser is built, not when run begins.
         load_environment()
         status = asyncio.run(run(parser().parse_args()))
     except KeyboardInterrupt:

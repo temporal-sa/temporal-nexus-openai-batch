@@ -1,4 +1,10 @@
-"""Transactional admission, immutable manifests and exact-attempt delivery state."""
+"""PostgreSQL owns batch membership, request bodies, and recoverable handoffs.
+
+Admission, sealing, and outcome persistence use transactions. Temporal receives
+only a small sealed batch reference; it does not act as a large request buffer.
+The dispatch and delivery outboxes bridge PostgreSQL and Temporal without a
+distributed transaction, using stable identities and retry-safe checkpoints.
+"""
 
 from __future__ import annotations
 
@@ -59,6 +65,8 @@ def _truncate(value: str, limit: int = 512) -> str:
 
 
 def bounded_diagnostics(values: list[str]) -> list[str]:
+    # Diagnostics appear in aggregate Workflow reports too. Bound their count and
+    # UTF-8 size so malformed provider output cannot grow orchestration payloads.
     return [_truncate(value) for value in values[:100]]
 
 
@@ -80,6 +88,13 @@ def _decode(cls, raw, description: str):
 
 
 class Store:
+    """Namespace-scoped repository; all workers share the same external state.
+
+    Admission locks a run row before its request/batch rows. This serializes the
+    membership decision within a run while allowing unrelated runs to proceed.
+    All mutation paths must preserve that lock order to avoid deadlocks.
+    """
+
     def __init__(self, pool: asyncpg.Pool, namespace: str):
         self.pool = pool
         self.namespace = namespace
@@ -111,6 +126,8 @@ class Store:
     async def _connection(
         self, operation: str, *, transaction: bool = False, readonly: bool = False
     ) -> AsyncIterator[asyncpg.Connection]:
+        # Read-only multi-query manifest/resource reads use one stable snapshot.
+        # Mutating transactions instead take explicit row locks where needed.
         try:
             async with self.pool.acquire() as conn:
                 if transaction:
@@ -126,6 +143,7 @@ class Store:
             raise RuntimeError(f"PostgreSQL {operation} failed") from None
 
     async def start_run(self, run: RunInput) -> None:
+        """Freeze configuration before Nexus admission; run IDs are never reused."""
         try:
             run.config.validate()
         except (ValueError, Failure) as exc:
@@ -155,6 +173,12 @@ class Store:
         return RunInput(run_id=run_id, config=_decode(Config, raw, "run configuration"))
 
     async def enroll(self, enrollment: Enrollment) -> Admission:
+        """Atomically deduplicate, append to a batch, and seal when a limit is met.
+
+        Repeating the same request and completion target is idempotent. A newer
+        attempt of the same SAA may refresh its token without re-admission. A
+        different operation, changed document, or stale attempt cannot take over.
+        """
         e, target = enrollment, enrollment.completion_target
         validate_request(e.request)
         if e.fingerprint != fingerprint(e.request) or not valid_target(target, self.namespace):
@@ -180,6 +204,8 @@ class Store:
                 old = _decode(CompletionTarget, previous["target"], "completion target")
                 admission = Admission(batch_id=previous["batch_id"], fingerprint=e.fingerprint, config=cfg)
                 if previous["fingerprint"] == e.fingerprint and old == target:
+                    # A lost database acknowledgement can retry the same write,
+                    # including after the run has closed to genuinely new input.
                     return admission
                 if old.activity_id == target.activity_id and old.activity_run_id == target.activity_run_id:
                     if (
@@ -208,6 +234,8 @@ class Store:
             if cfg.max_admissions > 0 and run["admitted"] >= cfg.max_admissions:
                 raise Failure("RUN_FULL", "batching run admission limit reached")
             line = jsonl_line(e.request, cfg)
+            # Count the actual provider line including its JSON wrapper/newline.
+            # Document length alone would undercount escaping and field overhead.
             if len(line) > cfg.max_batch_bytes:
                 raise Failure("INVALID_INPUT", "request exceeds configured batch byte limit")
             now = _now()
@@ -229,6 +257,8 @@ class Store:
                     raise RuntimeError("stored open batch is invalid")
                 count, byte_count = batch["requests"], batch["bytes"]
                 if byte_count + len(line) > cfg.max_batch_bytes or now >= batch["seal_at"]:
+                    # Seal before appending: never grow past the byte bound or
+                    # extend the collection window when another request arrives.
                     await self._seal(conn, e.request.run_id, batch_id, now)
                     sequence += 1
                     batch_id = None
@@ -279,6 +309,8 @@ class Store:
                 ) from None
             count += 1
             byte_count += len(line)
+            # A batch can only shorten its recipient deadline as members arrive.
+            # The sealed reference must respect the earliest waiting operation.
             await conn.execute(
                 """UPDATE nexus_batch_batches SET requests=$3,bytes=$4,deadline_at=LEAST(deadline_at,$5)
                 WHERE namespace=$1 AND batch_id=$2""",
@@ -298,7 +330,9 @@ class Store:
             return Admission(batch_id=batch_id, fingerprint=e.fingerprint, config=cfg)
 
     async def _seal(self, conn, run_id: str, batch_id: str, now: datetime) -> None:
-        # Callers acquire the run row before its batch row.
+        # Callers acquire the run row before its batch row. Sealing freezes
+        # membership and makes the row eligible for the dispatch outbox; it does
+        # not call Temporal or OpenAI while the admission transaction is open.
         await conn.execute(
             """UPDATE nexus_batch_batches SET state='sealed',sealed_at=$3
             WHERE namespace=$1 AND batch_id=$2 AND state='open' AND requests>0""",
@@ -315,9 +349,11 @@ class Store:
         )
 
     async def close_run(self, run_id: str) -> None:
+        """Seal the remaining partial batch and reject new admissions."""
         await self._close_run(run_id, False)
 
     async def stop_run(self, run_id: str) -> None:
+        """Stop future dispatch/submission/delivery; CLI cleanup also calls Temporal."""
         await self._close_run(run_id, True)
 
     async def _close_run(self, run_id: str, stop: bool) -> None:
@@ -372,7 +408,14 @@ class Store:
 
     @asynccontextmanager
     async def submission(self, batch_id: str) -> AsyncIterator[None]:
-        """Fence creation against stop; do not call other store methods in the body."""
+        """Fence provider creation against stop while the run row remains locked.
+
+        The external POST intentionally happens inside this bounded transaction:
+        stop must order either before submission, rejecting it, or after it. This
+        fence does not make OpenAI and PostgreSQL one atomic system; a lost POST
+        response still needs lookup-only reconciliation. Do not call other store
+        methods in the body, since they may need this locked row.
+        """
         async with asyncio.timeout(30):
             async with self._connection("submission", transaction=True) as conn:
                 row = await conn.fetchrow(
@@ -395,6 +438,7 @@ class Store:
                     yield
 
     async def seal_due(self, mode: str, endpoint: str, limit: int = 100) -> int:
+        """Close collection windows even when no new request arrives to trigger it."""
         async with self._connection("seal due", transaction=True) as conn:
             due = await conn.fetch(
                 """SELECT r.run_id,b.batch_id FROM nexus_batch_runs r JOIN nexus_batch_batches b
@@ -418,6 +462,12 @@ class Store:
             return len(due)
 
     async def ready_batches(self, mode: str, endpoint: str, limit: int = 100) -> list[BatchRef]:
+        """Lease sealed outbox rows so dispatchers can share recovery work.
+
+        SKIP LOCKED avoids waiting behind another worker. An expired lease makes
+        a row retryable after a crash; the stable Workflow ID handles a start
+        accepted by Temporal before the database acknowledgement was saved.
+        """
         async with self._connection("claim dispatch", transaction=True) as conn:
             rows = await conn.fetch(
                 """SELECT b.run_id,b.batch_id,r.config,b.requests,b.bytes,b.sealed_at,
@@ -447,6 +497,7 @@ class Store:
             return refs
 
     async def mark_dispatched(self, batch_id: str) -> None:
+        """Acknowledge a confirmed Workflow start, including AlreadyStarted."""
         async with self._connection("mark dispatch") as conn:
             tag = await conn.execute(
                 """UPDATE nexus_batch_batches SET dispatched=true,dispatch_claim_until=NULL
@@ -458,6 +509,11 @@ class Store:
                 raise Failure("BATCH_NOT_FOUND", "batch does not exist")
 
     async def load_manifest(self, batch_id: str) -> Manifest:
+        """Read sealed membership in admission order within a consistent snapshot.
+
+        The member documents are fixed after seal. A completion target may still
+        be refreshed when Temporal retries that same SAA; it is not a new member.
+        """
         async with self._connection("load manifest", transaction=True, readonly=True) as conn:
             row = await conn.fetchrow(
                 """SELECT b.run_id,r.config,b.sealed_at,b.bytes,b.state FROM nexus_batch_batches b
@@ -500,6 +556,8 @@ class Store:
             return manifest
 
     async def save_report(self, report: BatchReport) -> None:
+        # Reports are aggregate observation state. Request delivery rows remain
+        # authoritative if the independent keeper advances after this report.
         report = replace(report, diagnostics=bounded_diagnostics(report.diagnostics))
         async with self._connection("save report") as conn:
             tag = await conn.execute(
@@ -515,6 +573,7 @@ class Store:
                 raise Failure("BATCH_NOT_FOUND", "batch does not exist")
 
     async def status(self, run_id: str) -> RunStatus:
+        """Combine saved Workflow milestones with current delivery checkpoints."""
         async with self._connection("run status") as conn:
             run = await conn.fetchrow(
                 "SELECT admitted,closed FROM nexus_batch_runs WHERE namespace=$1 AND run_id=$2",
@@ -563,6 +622,12 @@ class Store:
             return status
 
     async def save_outcomes(self, batch_id: str, outcomes: list[Outcome], diagnostics: list[str]) -> None:
+        """Commit the complete reconciled set exactly once before delivery begins.
+
+        The batch lock makes a repeated results Activity harmless. Identity and
+        size checks prevent partial, duplicate, or mismatched results from being
+        exposed to callers; an outcome is exactly one result or one failure.
+        """
         async with self._connection("save outcomes", transaction=True) as conn:
             batch = await conn.fetchrow(
                 "SELECT outcomes_saved,state FROM nexus_batch_batches WHERE namespace=$1 AND batch_id=$2 FOR UPDATE",
@@ -628,6 +693,8 @@ class Store:
             )
 
     async def fail_batch(self, batch_id: str, code: str, message: str) -> None:
+        # Whole-batch failures use the same durable outcome/delivery path, so
+        # every enrolled caller can receive an explicit terminal failure.
         manifest = await self.load_manifest(batch_id)
         outcomes = [
             Outcome(
@@ -641,6 +708,7 @@ class Store:
         await self.save_outcomes(batch_id, outcomes, [code])
 
     async def pending_deliveries(self, batch_id: str, limit: int = 100) -> list[StoredDelivery]:
+        """Page persisted outcomes; no per-recipient array enters Workflow history."""
         async with self._connection("pending deliveries") as conn:
             rows = await conn.fetch(
                 """SELECT request_id,target,outcome FROM nexus_batch_requests WHERE namespace=$1 AND batch_id=$2
@@ -666,6 +734,12 @@ class Store:
         delivered: bool,
         diagnostic: str,
     ) -> None:
+        """Checkpoint only the exact target whose completion was just attempted.
+
+        A retry can refresh the row's token between the external completion call
+        and this update. Comparing the entire target prevents the old worker
+        from marking that newer attempt delivered or skipped by mistake.
+        """
         async with self._connection("mark delivery") as conn:
             tag = await conn.execute(
                 """UPDATE nexus_batch_requests SET
@@ -692,6 +766,8 @@ class Store:
                 # A newer attempt changed its token; never advance its checkpoint.
 
     async def delivery_summary(self, batch_id: str) -> DeliverySummary:
+        # Provider success/failure and delivery/skip are separate counts: a valid
+        # provider result can still belong to a caller that has already closed.
         async with self._connection("delivery summary") as conn:
             raw = await conn.fetchval(
                 "SELECT diagnostics FROM nexus_batch_batches WHERE namespace=$1 AND batch_id=$2",
@@ -730,6 +806,12 @@ class Store:
             return summary
 
     async def pending_heartbeats(self, mode: str, endpoint: str, limit: int = 100) -> list[CompletionTarget]:
+        """Claim due tokens and postpone their next beat by ten seconds atomically.
+
+        This spacing is below the SAA's thirty-second heartbeat timeout. A crash
+        after claiming may lose a beat; Temporal retry and token reattachment are
+        the recovery path rather than extending the original deadline.
+        """
         async with self._connection("claim heartbeat targets") as conn:
             rows = await conn.fetch(
                 """WITH due AS (
@@ -750,6 +832,11 @@ class Store:
             return [_decode(CompletionTarget, row["target"], "completion target") for row in rows]
 
     async def pending_completions(self, mode: str, endpoint: str, limit: int = 100) -> list[BatchDelivery]:
+        """Recover pending attempts even after the batch Workflow has completed.
+
+        This is needed when a newer SAA attempt reattaches to an already resolved
+        request. The original outcome is reused without another OpenAI batch.
+        """
         async with self._connection("pending completions") as conn:
             rows = await conn.fetch(
                 """SELECT q.batch_id,q.request_id,q.target,q.outcome FROM nexus_batch_requests q

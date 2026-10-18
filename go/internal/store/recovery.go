@@ -15,6 +15,12 @@ import (
 // StopRun cannot commit while a submission owns the run lock; once it commits,
 // no later submission callback for that run is allowed to start. The callback
 // must honor its bounded context and must not call back into the store.
+//
+// Holding a SQL lock across a network call is deliberately narrow here: it
+// establishes the ordering of a paid side effect against an explicit stop.
+// It does not make OpenAI part of the transaction. A lost response or failed
+// commit can still leave submission uncertain, which must be reconciled rather
+// than retried as another Create call.
 func (s *Store) WithSubmission(ctx context.Context, batchID string, create func(context.Context) error) error {
 	boundedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -116,6 +122,9 @@ func (s *Store) RunResources(ctx context.Context, runID string) ([]string, []mod
 // HeartbeatTargets claims a small page of exact pending SAA targets. Worker
 // processes keep these asynchronous attempts alive after SubmitRequest has
 // released its slot; a pre-enrollment worker death instead permits a retry.
+// The atomic claim advances next_heartbeat_at before returning targets. It is
+// a scheduling lease, not proof a heartbeat reached Temporal; another worker
+// can claim the target after that interval if this process crashes.
 func (s *Store) HeartbeatTargets(ctx context.Context, mode, endpoint string, limit int) ([]model.CompletionTarget, error) {
 	rows, err := s.pool.Query(ctx, `WITH due AS (
 		SELECT q.namespace,q.run_id,q.request_id
@@ -149,6 +158,8 @@ func (s *Store) HeartbeatTargets(ctx context.Context, mode, endpoint string, lim
 // PendingCompletions lets the independent keeper repair delivery after a batch
 // Workflow has already closed, including when a later SAA attempt reattaches.
 // Completion is exact-token idempotent; MarkDelivered fences its checkpoint.
+// Neither the provider job nor the Batch Workflow needs to run again to deliver
+// an already saved outcome to that newer attempt.
 func (s *Store) PendingCompletions(ctx context.Context, mode, endpoint string, limit int) ([]model.BatchDelivery, error) {
 	rows, err := s.pool.Query(ctx, `SELECT q.batch_id,q.request_id,q.target,q.outcome
 		FROM nexus_batch_requests q JOIN nexus_batch_runs r ON r.namespace=q.namespace AND r.run_id=q.run_id

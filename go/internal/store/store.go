@@ -1,6 +1,9 @@
 // Package store owns transactional enrollment, sealed manifests and completion
 // delivery state. Large batches and exact Activity attempt tokens stay here,
-// outside Temporal workflow histories.
+// outside Temporal workflow histories. Temporal coordinates work using small
+// batch references; Activities load the documents and recipient details here
+// when they need them. Database commits are the recovery boundaries between
+// admission, provider processing, and delivery.
 package store
 
 import (
@@ -24,6 +27,8 @@ const dispatchLease = 10 * time.Second
 //go:embed schema.sql
 var schemaSQL string
 
+// Store scopes every row to a Temporal namespace. Go and Python deployments can
+// use separate databases, while each worker pool shares its own durable records.
 type Store struct {
 	pool      *pgxpool.Pool
 	namespace string
@@ -70,6 +75,8 @@ func (s *Store) InitializeSchema(ctx context.Context) error {
 		return dbError("initialize schema", err)
 	}
 	defer tx.Rollback(ctx)
+	// Serialize DDL across worker startups. The transaction releases this advisory
+	// lock on commit or rollback, including if the process loses its connection.
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(819482729640031)"); err != nil {
 		return dbError("initialize schema", err)
 	}
@@ -79,6 +86,8 @@ func (s *Store) InitializeSchema(ctx context.Context) error {
 	return dbError("initialize schema", tx.Commit(ctx))
 }
 
+// CreateRun freezes the batching policy for a caller-selected run ID. A run is
+// an admission boundary, not a Workflow containing all of its requests.
 func (s *Store) CreateRun(ctx context.Context, input model.RunInput) error {
 	if err := input.Config.Validate(); err != nil {
 		return fail("INVALID_INPUT", err.Error())
@@ -113,6 +122,11 @@ func (s *Store) GetRun(ctx context.Context, runID string) (model.RunInput, error
 	return input, nil
 }
 
+// Enroll atomically owns one request, chooses its batch, and accounts for its
+// exact JSONL size. The run row is the serialization point: concurrent arrivals,
+// time-based sealing, and closing the run cannot disagree about membership.
+// No provider call occurs in this transaction; a sealed row becomes durable
+// work for the dispatcher only after this commit succeeds.
 func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission, error) {
 	if err := model.ValidateRequest(e.Request); err != nil {
 		return model.Admission{}, err
@@ -148,6 +162,8 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 		if json.Unmarshal(previousTarget, &target) != nil {
 			return model.Admission{}, fmt.Errorf("stored completion target is invalid")
 		}
+		// The same Activity attempt may retry enrollment after losing the database
+		// acknowledgment. Return its original membership without counting it twice.
 		if previousFingerprint == e.Fingerprint && reflect.DeepEqual(target, e.Target) {
 			return model.Admission{BatchID: previousBatch, Fingerprint: e.Fingerprint, Config: cfg}, nil
 		}
@@ -155,6 +171,8 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 			if previousFingerprint == e.Fingerprint && e.Target.Attempt > target.Attempt && previousDelivery != "delivered" && !stopped {
 				// A retried submission attempt reattaches to its original immutable
 				// membership and result. Only its exact completion target changes.
+				// Requiring the same Activity execution and a newer attempt prevents
+				// another operation from taking over this request ID or its result.
 				rawTarget, _ := json.Marshal(e.Target)
 				_, err = tx.Exec(ctx, `UPDATE nexus_batch_requests SET target=$4,delivery_status='pending',delivery_diagnostic='',next_heartbeat_at=clock_timestamp() WHERE namespace=$1 AND run_id=$2 AND request_id=$3`, s.namespace, e.Request.RunID, e.Request.RequestID, rawTarget)
 				if err != nil {
@@ -178,6 +196,8 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 	if cfg.MaxAdmissions > 0 && admitted >= int64(cfg.MaxAdmissions) {
 		return model.Admission{}, fail("RUN_FULL", "batching run admission limit reached")
 	}
+	// Count the provider's encoded bytes, including the JSONL envelope, rather
+	// than just the input text. This keeps the eventual upload within its cap.
 	line, err := model.JSONLLine(e.Request, cfg)
 	if err != nil {
 		return model.Admission{}, fail("INVALID_INPUT", "request cannot be serialized")
@@ -200,6 +220,8 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 			return model.Admission{}, dbError("enroll open batch", err)
 		}
 		if byteCount+len(line) > cfg.MaxBatchBytes || !now.Before(sealAt) {
+			// Seal before adding this request. The old batch keeps its original
+			// members; this request starts the next batch instead of overflowing it.
 			if err = s.seal(ctx, tx, e.Request.RunID, batchID, now); err != nil {
 				return model.Admission{}, err
 			}
@@ -209,6 +231,8 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 		}
 	}
 	if batchID == "" {
+		// IDs follow the run's locked sequence, so dispatch retries can always
+		// address the same logical batch Workflow after a worker restart.
 		batchID = fmt.Sprintf("%s-%08d", e.Request.RunID, sequence)
 		_, err = tx.Exec(ctx, `INSERT INTO nexus_batch_batches(namespace,batch_id,run_id,mode,endpoint,first_admitted_at,seal_at,deadline_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, s.namespace, batchID, e.Request.RunID, cfg.Mode, cfg.Endpoint, now, now.Add(cfg.Window), deadline)
 		if err != nil {
@@ -218,6 +242,8 @@ func (s *Store) Enroll(ctx context.Context, e model.Enrollment) (model.Admission
 			return model.Admission{}, dbError("open batch", err)
 		}
 	}
+	// The position records stable upload order. Correlation of results still
+	// uses request_id/custom_id, because OpenAI can return a different order.
 	rawRequest, _ := json.Marshal(e.Request)
 	rawTarget, _ := json.Marshal(e.Target)
 	_, err = tx.Exec(ctx, `INSERT INTO nexus_batch_requests(namespace,run_id,request_id,batch_id,request,target,activity_id,activity_run_id,fingerprint,admitted_at,position,deadline_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, s.namespace, e.Request.RunID, e.Request.RequestID, batchID, rawRequest, rawTarget, e.Target.ActivityID, e.Target.ActivityRunID, e.Fingerprint, now, count, deadline)
@@ -257,11 +283,16 @@ func (s *Store) seal(ctx context.Context, tx pgx.Tx, runID, batchID string, now 
 	return dbError("seal run", err)
 }
 
+// FinishRun closes admission and flushes the partial open batch. Existing
+// provider jobs and completion delivery continue to their normal outcomes.
 func (s *Store) FinishRun(ctx context.Context, runID string) error {
 	return s.closeRun(ctx, runID, false)
 }
 func (s *Store) CloseRun(ctx context.Context, runID string) error { return s.FinishRun(ctx, runID) }
-func (s *Store) StopRun(ctx context.Context, runID string) error  { return s.closeRun(ctx, runID, true) }
+
+// StopRun also marks pending recipients skipped. The same run lock is used by
+// WithSubmission, so a provider submission cannot begin after this stop commits.
+func (s *Store) StopRun(ctx context.Context, runID string) error { return s.closeRun(ctx, runID, true) }
 func (s *Store) closeRun(ctx context.Context, runID string, stop bool) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -302,6 +333,9 @@ func uniqueViolation(err error) bool {
 	var pg *pgconn.PgError
 	return errors.As(err, &pg) && pg.Code == "23505"
 }
+
+// dbError preserves cancellation and useful SQLSTATE categories without leaking
+// connection credentials, document text, or server diagnostics to callers.
 func dbError(op string, err error) error {
 	if err == nil {
 		return nil

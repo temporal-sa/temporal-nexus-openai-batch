@@ -1,4 +1,10 @@
-"""Workers, the dispatch outbox, and independent external-completion keepers."""
+"""Host the three worker roles and recoverable PostgreSQL background loops.
+
+The dispatcher starts Workflows from sealed rows. The keeper heartbeats enrolled
+SAAs and resumes pending completion after a batch Workflow has finished. Both can
+restart because PostgreSQL owns their work; neither loop is a durable scheduler
+by itself.
+"""
 
 import asyncio
 import logging
@@ -21,12 +27,15 @@ logger = logging.getLogger(__name__)
 
 
 def queues(mode: str) -> tuple[str, str, str, str]:
+    """Isolate fake and live traffic in the same Temporal namespace."""
     suffix = "-live" if mode == "live" else ""
     service = SERVICE_TASK_QUEUE + suffix
     return CALLER_TASK_QUEUE + suffix, service, service + "-batches", NEXUS_ENDPOINT + suffix
 
 
 async def dispatch_once(client: Client, store: Store, mode: str, endpoint: str, queue: str) -> None:
+    # Sealing is a database transition. Starting Temporal is a separate system,
+    # so the sealed row remains in an outbox until this handoff is acknowledged.
     await store.seal_due(mode, endpoint)
     for ref in await store.ready_batches(mode, endpoint):
         try:
@@ -38,11 +47,14 @@ async def dispatch_once(client: Client, store: Store, mode: str, endpoint: str, 
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
             )
         except WorkflowAlreadyStartedError:
+            # A crash after StartWorkflow but before mark_dispatched is harmless:
+            # the stable batch Workflow ID identifies the already accepted start.
             pass
         await store.mark_dispatched(ref.batch_id)
 
 
 async def dispatcher(client: Client, store: Store, mode: str, endpoint: str, queue: str) -> None:
+    """Retry the durable dispatch outbox with bounded backoff during outages."""
     delay = 0.1
     while True:
         try:
@@ -57,6 +69,14 @@ async def dispatcher(client: Client, store: Store, mode: str, endpoint: str, que
 
 
 async def maintain_enrollments(activities: Activities, mode: str, endpoint: str) -> None:
+    """Keep asynchronous SAAs alive without occupying Activity worker slots.
+
+    Enrollment returns its slot after ``raise_complete_async``. This independent
+    loop uses persisted task tokens to heartbeat those pending attempts while
+    OpenAI processes the batch. The store pages and schedules heartbeat claims;
+    a lost heartbeat can lead to a newer SAA attempt reattaching to the same row.
+    """
+
     async def heartbeat(target):
         async with asyncio.timeout(5):
             handle = activities.client.get_async_activity_handle(task_token=target.task_token)
@@ -74,6 +94,8 @@ async def maintain_enrollments(activities: Activities, mode: str, endpoint: str)
             targets = await activities.store.pending_heartbeats(mode, endpoint)
             await asyncio.gather(*(heartbeat(target) for target in targets), return_exceptions=True)
             rows = await activities.store.pending_completions(mode, endpoint)
+            # A newer SAA attempt may enroll after the batch Workflow's delivery
+            # pass. Persisted outcomes let the keeper finish that handoff too.
             await asyncio.gather(*(complete(row) for row in rows), return_exceptions=True)
             await asyncio.sleep(0 if len(targets) == 100 or len(rows) == 100 else 0.1)
         except Exception:
@@ -91,6 +113,11 @@ async def running_workers(
     service_concurrency: int = 32,
     batch_concurrency: int = 32,
 ):
+    """Run caller, Nexus/SAA, and batch work on independent task queues.
+
+    Long provider polling Activities consume batch capacity rather than blocking
+    new Nexus enrollment. The same process hosts all roles for this prototype.
+    """
     caller_queue, service_queue, batch_queue, endpoint = queues(mode)
     activities = Activities(client, store, provider)
     caller = Worker(client, task_queue=caller_queue, workflows=[CallerWorkflow])

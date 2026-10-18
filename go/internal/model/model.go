@@ -1,3 +1,7 @@
+// Package model defines the values crossing the CLI, Nexus, PostgreSQL and
+// provider boundaries. Keeping these values explicit makes the storage/history
+// boundary visible: BatchRef and aggregate reports may enter BatchWorkflow;
+// manifests, per-item outcomes and completion credentials remain in the store.
 package model
 
 import (
@@ -10,12 +14,15 @@ import (
 )
 
 const (
-	Service              = "llm-batch"
-	Operation            = "respond"
-	CallerTaskQueue      = "nexus-batch-callers"
-	ServiceTaskQueue     = "nexus-batch-service"
-	NexusEndpoint        = "llm-batch"
-	StatusQuery          = "status"
+	Service          = "llm-batch"
+	Operation        = "respond"
+	CallerTaskQueue  = "nexus-batch-callers"
+	ServiceTaskQueue = "nexus-batch-service"
+	NexusEndpoint    = "llm-batch"
+	StatusQuery      = "status"
+	// Per-request envelopes are deliberately small even when the aggregate
+	// batch is large. The provider hard limits apply to serialized JSONL bytes,
+	// not the size of an in-memory manifest containing completion credentials.
 	MaxRequestBytes      = 8 * 1024
 	MaxResultBytes       = 4 * 1024
 	HardMaxBatchRequests = 50_000
@@ -24,6 +31,9 @@ const (
 	EnrollmentHeartbeat  = 30 * time.Second
 )
 
+// Request is one logical unit of work. RequestID is unique within RunID and
+// becomes the provider's custom_id, which correlates unordered output lines
+// back to their original recipients.
 type Request struct {
 	RunID     string `json:"run_id"`
 	RequestID string `json:"request_id"`
@@ -35,12 +45,16 @@ type Usage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+// Result is the normalized, bounded success returned through Nexus. Raw provider
+// response envelopes remain behind the service boundary.
 type Result struct {
 	RequestID string `json:"request_id"`
 	Text      string `json:"text"`
 	Usage     *Usage `json:"usage"`
 }
 
+// Failure separates a stable application code from an optional upstream code.
+// It is persisted as an outcome and delivered as a structured Temporal failure.
 type Failure struct {
 	Code         string `json:"code"`
 	Message      string `json:"message"`
@@ -49,6 +63,8 @@ type Failure struct {
 
 func (f *Failure) Error() string { return f.Code + ": " + f.Message }
 
+// Outcome binds a reconciled success or failure to the admitted logical request
+// and its fingerprint. The store persists it before any completion RPC occurs.
 type Outcome struct {
 	RequestID   string   `json:"request_id"`
 	Fingerprint string   `json:"fingerprint"`
@@ -57,6 +73,9 @@ type Outcome struct {
 	Failure     *Failure `json:"failure,omitempty"`
 }
 
+// Config is fixed when a run is created so enrollment, JSONL sizing and execution
+// agree on the same model and limits. Go time.Duration values serialize as
+// nanoseconds in JSON; the Python copy has its own configuration representation.
 type Config struct {
 	Model            string        `json:"model"`
 	Mode             string        `json:"mode"`
@@ -65,12 +84,16 @@ type Config struct {
 	MaxBatchBytes    int           `json:"max_batch_bytes"`
 	MaxAdmissions    int           `json:"max_admissions"`
 	PollInterval     time.Duration `json:"poll_interval"`
+	// ResultDeadline budgets provider work after collection; OperationTimeout
+	// also covers collection and leaves time to complete the original recipient.
 	ResultDeadline   time.Duration `json:"result_deadline"`
 	OperationTimeout time.Duration `json:"operation_timeout"`
 	MaxOutputTokens  int           `json:"max_output_tokens"`
 	Endpoint         string        `json:"nexus_endpoint"`
 }
 
+// DefaultConfig gives fake runs a short feedback loop and live runs a longer
+// provider budget. Live mode requires the caller to supply a real model name.
 func DefaultConfig(mode string) Config {
 	c := Config{Model: "fake-model", Mode: mode, Window: 5 * time.Second, MaxBatchRequests: 100,
 		MaxBatchBytes: DefaultBatchBytes, MaxAdmissions: 0, PollInterval: 250 * time.Millisecond,
@@ -84,6 +107,9 @@ func DefaultConfig(mode string) Config {
 	return c
 }
 
+// Validate checks relationships as well as individual limits. A collection
+// window and provider wait must fit inside the recipient's operation timeout;
+// otherwise a valid provider result could consistently arrive too late.
 func (c Config) Validate() error {
 	if c.Mode != "fake" && c.Mode != "live" {
 		return fmt.Errorf("mode must be fake or live")
@@ -108,6 +134,8 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// RunInput creates the external-store admission scope. The run is a PostgreSQL
+// record, not a Workflow holding every incoming request in memory/history.
 type RunInput struct {
 	RunID  string `json:"run_id"`
 	Config Config `json:"config"`
@@ -118,6 +146,8 @@ type CallerInput struct {
 	Config  Config  `json:"config"`
 }
 
+// Enrollment is the durable handoff from the SAA to the store. Its deadline is
+// captured from the executing Activity rather than invented when a batch seals.
 type Enrollment struct {
 	Request     Request          `json:"request"`
 	Target      CompletionTarget `json:"completion_target"`
@@ -127,6 +157,8 @@ type Enrollment struct {
 
 // CompletionTarget fences external completion to the exact standalone Activity
 // execution and task attempt. TaskToken must never appear in user-facing logs.
+// A retry can keep ActivityID/ActivityRunID while changing Attempt and TaskToken;
+// retaining only an Activity ID would lose that distinction.
 type CompletionTarget struct {
 	Namespace     string `json:"namespace"`
 	ActivityID    string `json:"activity_id"`
@@ -135,17 +167,23 @@ type CompletionTarget struct {
 	Attempt       int32  `json:"attempt"`
 }
 
+// SAAInput carries one bounded request into the Nexus-backed standalone Activity.
+// It does not contain other batch members or their completion targets.
 type SAAInput struct {
 	Request Request `json:"request"`
 	Config  Config  `json:"config"`
 }
 
+// Admission confirms membership without returning the full manifest. Repeated
+// enrollment of the same exact request/target returns the same membership.
 type Admission struct {
 	BatchID     string `json:"batch_id"`
 	Fingerprint string `json:"fingerprint"`
 	Config      Config `json:"config"`
 }
 
+// Entry couples immutable logical membership with its current completion target.
+// A permitted SAA retry can refresh that target without adding another member.
 type Entry struct {
 	Request     Request          `json:"request"`
 	Target      CompletionTarget `json:"completion_target"`
@@ -153,6 +191,9 @@ type Entry struct {
 	AdmittedAt  time.Time        `json:"admitted_at"`
 }
 
+// Manifest materializes one sealed batch for Activity-local work. It can be much
+// larger than a Temporal payload because it contains every request and target;
+// it must never be passed to BatchWorkflow as an argument or Activity result.
 type Manifest struct {
 	RunID    string    `json:"run_id"`
 	BatchID  string    `json:"batch_id"`
@@ -172,7 +213,9 @@ type BatchRef struct {
 	Bytes           int       `json:"bytes"`
 	SealedAt        time.Time `json:"sealed_at"`
 	FirstAdmittedAt time.Time `json:"first_admitted_at"`
-	DeadlineAt      time.Time `json:"deadline_at"`
+	// DeadlineAt is the earliest admitted recipient deadline in this batch.
+	// Batch orchestration must honor it even if the dispatcher starts late.
+	DeadlineAt time.Time `json:"deadline_at"`
 }
 
 // StoredDelivery is loaded and consumed within an Activity, never a Workflow.
@@ -188,6 +231,9 @@ type BatchDelivery struct {
 	StoredDelivery
 }
 
+// DeliverySummary separates business outcomes (Succeeded/Failed) from transport
+// outcomes (Delivered/Skipped). A failed model request can be delivered correctly,
+// while a successful model result may target a recipient that already timed out.
 type DeliverySummary struct {
 	Delivered     int            `json:"delivered"`
 	Skipped       int            `json:"skipped"`
@@ -197,6 +243,8 @@ type DeliverySummary struct {
 	Diagnostics   []string       `json:"diagnostics,omitempty"`
 }
 
+// BatchReport is coarse progress safe to return to a Workflow or CLI. Provider
+// status is not updated on every HTTP poll; phase transitions are persisted.
 type BatchReport struct {
 	BatchID          string         `json:"batch_id"`
 	ProviderBatchID  string         `json:"provider_batch_id,omitempty"`
@@ -229,6 +277,8 @@ type RunStatus struct {
 
 var validID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$`)
 
+// ValidateRequest bounds the full JSON envelope, including IDs and escaping,
+// rather than only the number of characters in the document text.
 func ValidateRequest(r Request) error {
 	if !validID.MatchString(r.RunID) || !validID.MatchString(r.RequestID) {
 		return &Failure{Code: "INVALID_INPUT", Message: "run_id and request_id must be 1-96 letters, digits, dots, underscores or hyphens"}
@@ -246,6 +296,8 @@ func ValidateRequest(r Request) error {
 	return nil
 }
 
+// Fingerprint detects conflicting content for the same admitted logical request.
+// It is an ownership/integrity check, not a provider-side idempotency key.
 func Fingerprint(r Request) string {
 	b, _ := json.Marshal(r)
 	h := sha256.Sum256(b)
@@ -254,6 +306,9 @@ func Fingerprint(r Request) string {
 func BatchWorkflowID(batchID string) string   { return "batch/" + batchID }
 func CallerID(runID, requestID string) string { return "caller/" + runID + "/" + requestID }
 
+// JSONLLine defines the current provider request contract: one POST to Responses
+// per document, with RequestID as custom_id. It is shared by admission's byte
+// accounting and final upload so limits use the bytes actually sent upstream.
 func JSONLLine(r Request, c Config) ([]byte, error) {
 	line := struct {
 		CustomID string `json:"custom_id"`
@@ -275,6 +330,9 @@ func JSONLLine(r Request, c Config) ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
+// JSONL builds an upload inside an Activity and checks the sealed batch bounds
+// again. Request ordering is preserved here, but output reconciliation must use
+// custom_id because the provider need not return results in the same order.
 func JSONL(m Manifest) ([]byte, error) {
 	var out []byte
 	for _, e := range m.Entries {

@@ -15,6 +15,9 @@ import (
 
 // Repository keeps batch membership, request bodies, results and completion
 // credentials outside Temporal histories. Implemented by the Postgres store.
+// The store also owns two durable handoffs: sealed batches waiting for Workflow
+// dispatch and stored outcomes waiting for exact-attempt external completion.
+// Neither handoff depends on an in-memory channel surviving a worker restart.
 type Repository interface {
 	GetRun(context.Context, string) (model.RunInput, error)
 	Enroll(context.Context, model.Enrollment) (model.Admission, error)
@@ -35,6 +38,8 @@ type Repository interface {
 
 // Dispatcher drains the database outbox. A crash between the Temporal start
 // and MarkDispatched is safe: the stable Workflow ID rejects another execution.
+// It runs outside a Workflow, so SQL and client RPCs are allowed here. Its loop
+// is not durable by itself; the pending rows are what let another process resume.
 func Dispatcher(ctx context.Context, c client.Client, repo Repository, mode, queue, endpoint string) error {
 	keeperCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -67,6 +72,9 @@ func Dispatcher(ctx context.Context, c client.Client, repo Repository, mode, que
 	}
 }
 
+// DispatchOnce seals elapsed collection windows, then starts each ready batch.
+// Size-limited batches may already be sealed by enrollment. Mode and endpoint
+// scope this worker to the runs it is configured to serve.
 func DispatchOnce(ctx context.Context, c client.Client, repo Repository, mode, queue, endpoint string) error {
 	if _, err := repo.SealDue(ctx, mode, endpoint, 100); err != nil {
 		return err
@@ -76,6 +84,9 @@ func DispatchOnce(ctx context.Context, c client.Client, repo Repository, mode, q
 		return err
 	}
 	for _, ref := range refs {
+		// Never mark the outbox row first: a crash could then lose the start.
+		// Starting first is recoverable because repeated starts reuse this ID
+		// and reject both an existing running execution and a completed one.
 		_, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 			ID: model.BatchWorkflowID(ref.BatchID), TaskQueue: queue,
 			WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
@@ -96,6 +107,8 @@ func DispatchOnce(ctx context.Context, c client.Client, repo Repository, mode, q
 
 // Deliver pages through durable database checkpoints inside one Activity.
 // Neither its input nor its result contains individual request data or tokens.
+// Paging bounds each SQL read; it also avoids scheduling thousands of per-item
+// Activities whose arguments and results would grow the batch's history.
 func (a *ServiceActivities) Deliver(ctx context.Context, ref model.BatchRef) (model.DeliverySummary, error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -116,6 +129,10 @@ func (a *ServiceActivities) Deliver(ctx context.Context, ref model.BatchRef) (mo
 			if err != nil {
 				return model.DeliverySummary{}, err
 			}
+			// Completion and this SQL write cannot be atomic. If the write is
+			// lost, CompleteResult inspects the exact closed execution on retry.
+			// The expected target also fences this checkpoint against a newer
+			// SAA attempt that reattached while the RPC was in flight.
 			if err := a.Store.MarkDelivered(ctx, ref.BatchID, row.RequestID, row.Target, delivery.Delivered, delivery.Diagnostic); err != nil {
 				return model.DeliverySummary{}, err
 			}
@@ -126,10 +143,16 @@ func (a *ServiceActivities) Deliver(ctx context.Context, ref model.BatchRef) (mo
 // Pending SAAs heartbeat through durable Postgres ownership after releasing their
 // worker slot. Before enrollment exists, a lost worker is recovered by the SAA's
 // heartbeat timeout and retry policy. Each retry rebinds only its own execution.
+// This keeper is deliberately independent of BatchWorkflow: an enrolled request
+// needs heartbeats while still collecting, during provider processing, and while
+// repairing delivery after its batch Workflow has already completed.
 func maintainEnrollments(ctx context.Context, c client.Client, repo Repository, mode, endpoint string) {
 	for ctx.Err() == nil {
 		rows, err := repo.HeartbeatTargets(ctx, mode, endpoint, 100)
 		if err == nil {
+			// The store claims only due targets in bounded pages. RPCs run
+			// concurrently so one slow recipient does not serialize the page;
+			// a failed claim/RPC is retried by a later scan, not held in memory.
 			var group sync.WaitGroup
 			for _, target := range rows {
 				group.Add(1)

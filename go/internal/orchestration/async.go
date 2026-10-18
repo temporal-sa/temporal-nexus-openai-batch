@@ -14,10 +14,11 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
-// SubmitRequest is the Nexus-invoked standalone Activity. Durable enrollment
-// owns the exact attempt token before this function releases its worker slot.
-// ErrResultPending releases the worker slot; durable enrollment keeps the exact
-// attempt alive until its result can be completed externally.
+// SubmitRequest is the Nexus-invoked standalone Activity. It validates and
+// enrolls one request, then hands responsibility to the store-backed keeper.
+// ErrResultPending tells the SDK that execution is awaiting external completion:
+// it releases the worker slot without reporting a successful empty result.
+// PostgreSQL must own the exact attempt token before this handoff happens.
 func (a *ServiceActivities) SubmitRequest(ctx context.Context, input model.SAAInput) (model.Result, error) {
 	if err := model.ValidateRequest(input.Request); err != nil {
 		return model.Result{}, typedFailure(err)
@@ -26,9 +27,14 @@ func (a *ServiceActivities) SubmitRequest(ctx context.Context, input model.SAAIn
 		return model.Result{}, failure("INVALID_INPUT", err.Error())
 	}
 	info := activity.GetInfo(ctx)
+	// A standalone Activity has its own execution/run identity. A Workflow-owned
+	// Activity must not accidentally enter this exact-SAA completion protocol.
 	if info.ActivityRunID == "" || info.ActivityID == "" || info.Namespace == "" || len(info.TaskToken) == 0 {
 		return model.Result{}, failure("INVALID_ACTIVITY_TARGET", "SubmitRequest requires a standalone Activity execution")
 	}
+	// Copy the SDK token because it is the credential for this specific attempt.
+	// IDs describe the execution; the token prevents an old delivery from
+	// completing a newer attempt that happens to share those execution IDs.
 	enrollment := model.Enrollment{Request: input.Request, Fingerprint: model.Fingerprint(input.Request), Target: model.CompletionTarget{
 		Namespace: info.Namespace, ActivityID: info.ActivityID, ActivityRunID: info.ActivityRunID,
 		TaskToken: append([]byte(nil), info.TaskToken...), Attempt: info.Attempt,
@@ -46,6 +52,9 @@ func (a *ServiceActivities) SubmitRequest(ctx context.Context, input model.SAAIn
 		if err == nil {
 			return model.Result{}, activity.ErrResultPending
 		}
+		// A commit acknowledgment can be lost. Repeating the same enrollment
+		// is safe because the store checks request fingerprint and exact target;
+		// a different operation claiming the logical ID is rejected instead.
 		if !retryEnrollment(err) || attempt == 4 {
 			break
 		}
@@ -59,6 +68,9 @@ func (a *ServiceActivities) SubmitRequest(ctx context.Context, input model.SAAIn
 	return model.Result{}, err
 }
 
+// retryEnrollment keeps a short, bounded local retry loop inside the Activity.
+// Temporal's SAA retry policy remains the recovery path after this attempt ends.
+// Validation/authorization failures are not made retryable by this local loop.
 func retryEnrollment(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
@@ -72,6 +84,9 @@ func retryEnrollment(err error) bool {
 	return !errors.As(err, &permission) && !errors.As(err, &invalid)
 }
 
+// DeliveryResult describes the completion RPC, independently of whether the
+// model request succeeded. A delivered Failure is still a successful delivery;
+// a skipped target could have timed out, been canceled, or changed attempts.
 type DeliveryResult struct {
 	Delivered  bool
 	Skipped    bool
@@ -94,6 +109,9 @@ func (a *ServiceActivities) CompleteResult(ctx context.Context, target model.Com
 		return DeliveryResult{}, failure("INVALID_RESULT", "completion has no result or failure")
 	}
 	handle := a.Client.GetActivityHandle(client.GetActivityHandleOptions{ActivityID: target.ActivityID, RunID: target.ActivityRunID})
+	// Inspect the exact execution before using its token. A closed execution
+	// may already hold this outcome from an earlier delivery whose SQL checkpoint
+	// or RPC acknowledgment was lost.
 	description, inspectErr := handle.Describe(ctx, client.DescribeActivityOptions{IncludeOutcome: true})
 	if inspectErr != nil {
 		return completionInspectionError(inspectErr)
@@ -136,6 +154,9 @@ func completionInspectionError(err error) (DeliveryResult, error) {
 	return DeliveryResult{}, err
 }
 
+// reconcileCompletion treats a closed execution as delivered only when its
+// stored success or structured failure matches the intended outcome. Merely
+// finding an execution closed is insufficient evidence that our result arrived.
 func reconcileCompletion(description *client.ActivityExecutionDescription, outcome model.Outcome) (DeliveryResult, error) {
 	switch description.Status {
 	case enums.ACTIVITY_EXECUTION_STATUS_COMPLETED:

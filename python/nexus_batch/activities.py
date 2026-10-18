@@ -1,4 +1,10 @@
-"""Network and database operations. Bulk data stays inside these Activities."""
+"""Perform external I/O while Workflows retain only small control records.
+
+The SAA enrollment path gives its completion token to PostgreSQL. Batch Activities
+load documents and outcomes from that same store, and deliver each outcome to the
+original SAA. Activity retries are expected, so store writes and completion
+checkpoints must tolerate an operation succeeding before its response is lost.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +40,8 @@ from .store import Store
 
 @dataclass
 class CreateResult:
+    """Distinguish rejection from an uncertain accepted provider submission."""
+
     job: Job = field(default_factory=lambda: Job(id="", status=""))
     failure: str = ""
     failure_code: str = ""
@@ -47,16 +55,21 @@ class DeliveryResult:
 
 
 def application_failure(failure: Failure) -> ApplicationError:
+    # Preserve a machine-readable failure for the caller and for verification of
+    # a previously accepted completion. It must not restart a failed request.
     return ApplicationError(
         failure.message, loads(dict, dumps(failure)), type=failure.code, non_retryable=True
     )
 
 
 def metadata(ref: BatchRef) -> dict[str, str]:
+    """Attach lookup keys to OpenAI jobs so a lost create response can be found."""
     return {"run_id": ref.run_id, "logical_batch_id": ref.batch_id}
 
 
 def control_job(job: Job) -> Job:
+    # Metadata is useful inside provider I/O; only job control fields need to
+    # enter the Workflow history as Activity results.
     return replace(job, metadata={})
 
 
@@ -83,6 +96,12 @@ class Activities:
 
     @activity.defn
     async def submit_request(self, input: SAAInput) -> Result:
+        """Persist one Nexus-invoked SAA, then complete it asynchronously later.
+
+        This is deliberately a short Activity body. Waiting on OpenAI happens in
+        a batch Activity; the runtime keeper heartbeats this enrolled SAA while
+        its worker slot is free to accept another request.
+        """
         try:
             validate_request(input.request)
             input.config.validate()
@@ -96,6 +115,8 @@ class Activities:
                 "standalone Activity required", type="INVALID_ACTIVITY_TARGET", non_retryable=True
             )
         deadlines = []
+        # Use Temporal's actual execution timestamps, not a fresh timeout starting
+        # at enrollment. A retry must not renew the caller's completion budget.
         if info.schedule_to_close_timeout:
             deadlines.append(info.scheduled_time + info.schedule_to_close_timeout)
         if info.start_to_close_timeout:
@@ -120,10 +141,13 @@ class Activities:
                     if attempt == 4:
                         raise
                     await asyncio.sleep(0.1 * 2**attempt)
+        # The enrollment transaction has committed before this handoff. A worker
+        # crash cannot leave a successfully enrolled request only in local memory.
         activity.raise_complete_async()
 
     @activity.defn
     async def upload(self, ref: BatchRef) -> str:
+        """Build JSONL in Activity memory from the sealed PostgreSQL manifest."""
         manifest = await self.store.load_manifest(ref.batch_id)
         try:
             return await self.provider.upload(ref.batch_id, jsonl(manifest))
@@ -136,6 +160,8 @@ class Activities:
         # One Activity attempt and one HTTP attempt. A lost response is reconciled.
         called = False
         try:
+            # Hold the run's stop fence over this external call. A concurrent
+            # cleanup cannot pass its stop transition and then allow a new POST.
             async with self.store.submission(ref.batch_id):
                 called = True
                 try:
@@ -152,6 +178,7 @@ class Activities:
 
     @activity.defn
     async def find(self, ref: BatchRef, file_id: str) -> CreateResult:
+        """Accept exactly one matching existing job; absence does not permit POST."""
         try:
             jobs = await self.provider.find(metadata(ref))
         except ProviderError as exc:
@@ -171,6 +198,8 @@ class Activities:
 
     @activity.defn
     async def poll(self, job: Job, deadline: datetime, interval: float) -> Job:
+        # Heartbeat separately from HTTP so a slow response does not look like a
+        # dead Activity. The absolute deadline still bounds sleeps and retrieval.
         async with heartbeating(job.id):
             while True:
                 remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
@@ -194,6 +223,12 @@ class Activities:
 
     @activity.defn
     async def results(self, ref: BatchRef, job: Job) -> DeliverySummary:
+        """Normalize unordered provider files before exposing any completion.
+
+        Both success and error files are reconciled against the stored manifest.
+        Save all outcomes atomically first, so a crash during delivery can resume
+        without downloading or interpreting provider results differently.
+        """
         manifest = await self.store.load_manifest(ref.batch_id)
         try:
             files = [
@@ -219,6 +254,7 @@ class Activities:
 
     @activity.defn
     async def deliver(self, ref: BatchRef) -> DeliverySummary:
+        """Page through the delivery outbox; return aggregate counts to history."""
         async with heartbeating(ref.batch_id):
             while True:
                 rows = await self.store.pending_deliveries(ref.batch_id)
@@ -235,6 +271,13 @@ class Activities:
                     )
 
     async def complete(self, target: CompletionTarget, outcome: Outcome) -> DeliveryResult:
+        """Complete the recorded execution and attempt, never a replacement SAA.
+
+        The task token authorizes completion, while the explicit identity and
+        attempt checks explain whether a stale token is still appropriate. A
+        terminal mismatch is a skipped delivery; transient RPC errors are raised
+        so the outbox stays pending for retry.
+        """
         if (
             target.namespace != self.client.namespace
             or not target.task_token
@@ -262,6 +305,8 @@ class Activities:
         if description.attempt != target.attempt:
             return DeliveryResult(diagnostic="completion target has a superseding attempt")
         async_handle = self.client.get_async_activity_handle(task_token=target.task_token)
+        # Success here completes the SAA, which completes the Nexus operation and
+        # resumes the caller's durable wait. No signal to the caller is required.
         try:
             if outcome.failure:
                 await async_handle.fail(application_failure(outcome.failure))
@@ -286,6 +331,11 @@ class Activities:
 
     @staticmethod
     async def _reconcile_completion(description, outcome: Outcome) -> DeliveryResult:
+        """Confirm a lost acknowledgement by comparing the actual closed outcome.
+
+        Merely observing that an Activity closed is insufficient: cancellation or
+        another result must not count as successful delivery of our outcome.
+        """
         try:
             if description.status == ActivityExecutionStatus.COMPLETED and outcome.result:
                 if await description.result(Result) == outcome.result:
@@ -306,5 +356,7 @@ class Activities:
 
     @staticmethod
     def _provider_error(exc: ProviderError) -> None:
+        # Permanent provider rejections stop Activity retries. Transient failures
+        # can retry through Temporal or the next poll, within the same deadline.
         if exc.permanent:
             raise ApplicationError(str(exc), type="PROVIDER_ERROR", non_retryable=True) from exc
