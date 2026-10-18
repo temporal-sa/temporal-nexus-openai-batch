@@ -8,14 +8,9 @@ This repository contains equivalent Go and Python implementations. Both currentl
 
 | Path | Purpose |
 | --- | --- |
-| `cmd/batchctl` | Go command line application |
-| `internal/model` | Request types, configuration and JSONL encoding |
-| `internal/store` | PostgreSQL admission, batches and delivery checkpoints |
-| `internal/orchestration` | Nexus service, Activities, Workflows and dispatch |
-| `internal/provider` | OpenAI and persistent fake providers |
-| `integration` | Go tests against PostgreSQL and Temporal |
-| `python` | Python application, tests and [run instructions](python/README.md) |
-| `scripts` | Local services, endpoint setup and cleanup |
+| `go/` | Go application, tests and [structure](go/README.md) |
+| `python/` | Python application, tests and [run instructions](python/README.md) |
+| `scripts/` | Shared PostgreSQL and Temporal development services |
 | `samples` | Three example documents |
 | `docs/testing.md` | Test commands and coverage |
 
@@ -34,6 +29,8 @@ Provider work uses an absolute deadline capped by the earliest recipient deadlin
 ## Run the Go application
 
 Use Go 1.26+, PostgreSQL 17 and Temporal CLI 1.9.1 / Server 1.32.0. The repository's runtime script installs the pinned Temporal CLI. On macOS, native PostgreSQL can be installed with `brew install postgresql@17`.
+
+Run the following commands from the repository root. The Makefile builds and tests the module in `go/`; the executable is written to `bin/batchctl`.
 
 ```sh
 make runtime

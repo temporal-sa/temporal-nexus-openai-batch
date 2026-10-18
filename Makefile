@@ -11,13 +11,13 @@ PYTHON_DATABASE_URL ?= postgres://nexus_batch:nexus_batch@127.0.0.1:54329/nexus_
 
 .PHONY: build test test-integration test-store runtime postgres postgres-docker postgres-stop init-db server setup worker demo live inspect clean
 build:
-	go build -o bin/batchctl ./cmd/batchctl
+	go -C go build -o ../bin/batchctl ./cmd/batchctl
 test:
-	go test -race ./internal/... ./cmd/...
+	go -C go test -race ./internal/... ./cmd/...
 test-integration: build
-	NEXUS_INTEGRATION=1 TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) go test -v -count=1 -timeout=8m ./integration
+	NEXUS_INTEGRATION=1 TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) go -C go test -v -count=1 -timeout=8m ./integration
 test-store:
-	POSTGRES_TEST=1 go test -v -race -count=1 -run TestPostgres ./internal/store ./integration
+	POSTGRES_TEST=1 go -C go test -v -race -count=1 -run TestPostgres ./internal/store ./integration
 postgres:
 	bash scripts/postgres-runtime.sh start
 postgres-stop:
@@ -32,7 +32,7 @@ server:
 	mkdir -p .state
 	bash scripts/temporal-runtime.sh server start-dev --ip 127.0.0.1 --port 7234 --ui-port 8234 --db-filename .state/temporal-saa.db --dynamic-config-value activity.enableCallbacks=true
 setup:
-	TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) bash scripts/setup.sh $(MODE)
+	TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) bash go/scripts/setup.sh $(MODE)
 worker: build
 	bin/batchctl worker --mode $(MODE) --address $(TEMPORAL_ADDRESS)
 demo: build
@@ -42,7 +42,7 @@ live: build
 inspect: build
 	bin/batchctl inspect --run-id $(RUN_ID) --address $(TEMPORAL_ADDRESS)
 clean:
-	@echo 'Run bash scripts/cleanup.sh RUN_ID to cancel only one prototype run; see README.'
+	@echo 'Run bash go/scripts/cleanup.sh RUN_ID to cancel only one prototype run; see README.'
 
 .PHONY: python-install python-init python-setup python-worker python-demo python-test python-test-store python-test-workflows python-test-integration
 python-install:

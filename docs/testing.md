@@ -10,6 +10,8 @@ make test-store         # PostgreSQL required
 make test-integration   # PostgreSQL and Temporal required
 ```
 
+Run Make targets from the repository root. For direct Go commands, use `go -C go test ./...` or change into `go/` first.
+
 `DATABASE_URL` selects the Go database. `TEMPORAL_ADDRESS` defaults to `127.0.0.1:7234`. Start Temporal with `--dynamic-config-value activity.enableCallbacks=true` and stop application workers before integration tests own their queues.
 
 For an abrupt worker process failure, register the fake endpoint, build the CLI, and stop other fake workers:
@@ -17,7 +19,7 @@ For an abrupt worker process failure, register the fake endpoint, build the CLI,
 ```sh
 make build
 make setup
-python3 scripts/verify-hardkill.py
+python3 go/scripts/verify-hardkill.py
 ```
 
 The suites cover concurrent admission, fixed-window/count/byte sealing, duplicate ownership, dispatch lease recovery, deadline handling, stop/submission races, uncertain provider creation, result reconciliation, worker loss before and after enrollment, exact-attempt completion and partial delivery recovery. Large-manifest tests inspect Workflow history for bounded payloads and absence of batch documents, tokens and individual outcomes.
