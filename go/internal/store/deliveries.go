@@ -10,6 +10,11 @@ import (
 	"github.com/temporal-sa/temporal-nexus-openai-batch/go/internal/model"
 )
 
+// SaveOutcomes commits an entire reconciliation before any recipient is
+// completed. Each manifest request must have exactly one bounded result or
+// failure, including requests missing from the provider files. This transaction
+// turns those outcomes into the durable completion outbox: delivery can retry
+// after crashes without downloading or interpreting the provider files again.
 func (s *Store) SaveOutcomes(ctx context.Context, batchID string, outcomes []model.Outcome, diagnostics []string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -51,6 +56,8 @@ func (s *Store) SaveOutcomes(ctx context.Context, batchID string, outcomes []mod
 	if err != nil {
 		return dbError("outcome identity", err)
 	}
+	// Count, identity, fingerprint, and terminal-value checks together prevent
+	// a partial download or an outcome for another batch from being committed.
 	if len(identity) != len(outcomes) {
 		return fail("INVALID_RESULT", "reconciliation must resolve every manifest request exactly once")
 	}
@@ -87,6 +94,9 @@ func (s *Store) SaveOutcomes(ctx context.Context, batchID string, outcomes []mod
 	return dbError("commit outcomes", tx.Commit(ctx))
 }
 
+// FailBatch uses the same all-or-nothing outcome path for orchestration failures
+// as for provider results, so every admitted recipient can receive a terminal
+// failure instead of waiting indefinitely for a missing result.
 func (s *Store) FailBatch(ctx context.Context, batchID, code, message string) error {
 	// Only Activity code loads the manifest. Neither it nor the completion
 	// targets are returned to the Batch Workflow.
@@ -101,6 +111,10 @@ func (s *Store) FailBatch(ctx context.Context, batchID, code, message string) er
 	return s.SaveOutcomes(ctx, batchID, outcomes, []string{code})
 }
 
+// PendingDeliveries loads a bounded page for the delivery Activity. It returns
+// exact completion tokens only to worker code; the Workflow sees a summary.
+// This read does not exclusively claim recipients. Concurrent delivery is
+// reconciled against Temporal's exact Activity attempt and the fenced checkpoint.
 func (s *Store) PendingDeliveries(ctx context.Context, batchID string, limit int) ([]model.StoredDelivery, error) {
 	rows, err := s.pool.Query(ctx, `SELECT request_id,target,outcome FROM nexus_batch_requests WHERE namespace=$1 AND batch_id=$2 AND delivery_status='pending' AND outcome IS NOT NULL ORDER BY position LIMIT $3`, s.namespace, batchID, boundedLimit(limit))
 	if err != nil {
@@ -122,6 +136,11 @@ func (s *Store) PendingDeliveries(ctx context.Context, batchID string, limit int
 	return deliveries, dbError("read delivery", rows.Err())
 }
 
+// MarkDelivered acknowledges one outbox item only if its current recipient
+// still equals the target that was attempted. Temporal completion and this SQL
+// write cannot share a transaction: the delivery code handles a lost Temporal
+// acknowledgment, and this target comparison prevents a stale writer from
+// consuming work that a newer SAA attempt has just reattached.
 func (s *Store) MarkDelivered(ctx context.Context, batchID, requestID string, expected model.CompletionTarget, delivered bool, diagnostic string) error {
 	status := "skipped"
 	if delivered {
@@ -154,6 +173,9 @@ func (s *Store) MarkDelivered(ctx context.Context, batchID, requestID string, ex
 	return nil
 }
 
+// DeliverySummary counts provider outcomes separately from delivery outcomes.
+// A failed model request can still be successfully delivered as a failure;
+// conversely a successful model result may be skipped for a closed recipient.
 func (s *Store) DeliverySummary(ctx context.Context, batchID string) (model.DeliverySummary, error) {
 	summary := model.DeliverySummary{FailureCounts: map[string]int{}, Diagnostics: []string{}}
 	var rawDiagnostics []byte

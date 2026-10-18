@@ -17,6 +17,8 @@ import (
 	"time"
 )
 
+// FakeConfig controls local provider behavior without replacing the real
+// PostgreSQL admission, Temporal execution, or Nexus callback path.
 type FakeConfig struct {
 	StateDir        string
 	Scenario        string
@@ -72,6 +74,8 @@ func (p *Fake) Upload(ctx context.Context, logicalBatchID string, data []byte) (
 	if len(data) == 0 || int64(len(data)) > defaultMaxFileBytes {
 		return "", &Error{Op: "upload", Code: "input_size", Message: "input file is empty or exceeds configured size limit", Permanent: true}
 	}
+	// Content plus logical batch identity makes repeated uploads stable while
+	// keeping identical documents in different batches independently addressable.
 	hash := sha256.New()
 	hash.Write([]byte(logicalBatchID))
 	hash.Write([]byte{0})
@@ -81,6 +85,9 @@ func (p *Fake) Upload(ctx context.Context, logicalBatchID string, data []byte) (
 	return id, err
 }
 
+// Create persists a new, randomly identified job on every call, just as a blind
+// resubmission could create duplicate paid work with the live provider. Recovery
+// must find the original metadata match instead of relying on fake deduplication.
 func (p *Fake) Create(ctx context.Context, fileID string, metadata map[string]string) (job Job, err error) {
 	err = p.locked(ctx, func(state *fakeState) error {
 		data, err := p.readFile(fileID)
@@ -119,6 +126,8 @@ func (p *Fake) Create(ctx context.Context, fileID string, metadata map[string]st
 		return Job{}, err
 	}
 	if p.scenario == "submission-unknown" || p.scenario == "submission-unreconciled" {
+		// Persist first, then lose the acknowledgment. The unreconciled variant
+		// also hides the job from Find, exercising the no-blind-resubmit rule.
 		return Job{}, &Error{Op: "create", Code: "submission_unknown", Message: "simulated connection loss after submission", Ambiguous: true}
 	}
 	return job, nil
@@ -173,6 +182,8 @@ func (p *Fake) Results(ctx context.Context, job Job) (output, errorFile []byte, 
 	return output, errorFile, err
 }
 
+// currentFakeJob derives progress from persisted wall-clock time, so completing
+// a processing delay does not require the original worker process to stay alive.
 func currentFakeJob(record fakeRecord) Job {
 	job := record.Job
 	job.Metadata = copyMetadata(job.Metadata)
@@ -184,6 +195,10 @@ func currentFakeJob(record fakeRecord) Job {
 	return job
 }
 
+// locked serializes the complete read/modify/write cycle. The mutex coordinates
+// goroutines sharing this instance; flock coordinates separate worker processes
+// sharing StateDir. Loading state only after both locks prevents stale writers
+// from overwriting each other's submitted jobs during restart tests.
 func (p *Fake) locked(ctx context.Context, fn func(*fakeState) error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -192,6 +207,8 @@ func (p *Fake) locked(ctx context.Context, fn func(*fakeState) error) error {
 		return err
 	}
 	defer lock.Close()
+	// Nonblocking flock plus a short timer lets cancellation interrupt lock
+	// contention instead of leaving a worker blocked in a system call.
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -246,6 +263,9 @@ func (p *Fake) writeFile(id string, data []byte) error {
 	return atomicWrite(filepath.Join(p.dir, "files", id), data)
 }
 
+// atomicWrite publishes a complete file via a same-directory rename. Readers
+// observe the old or new file rather than a partially written JSON document.
+// Sync flushes the temporary file before it becomes the visible destination.
 func atomicWrite(path string, data []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".pending-")
 	if err != nil {
@@ -271,6 +291,9 @@ func atomicWrite(path string, data []byte) error {
 	return os.Rename(name, path)
 }
 
+// fakeResults produces the same JSONL envelope shape consumed by Reconcile.
+// Scenarios deliberately include missing, duplicate, unknown, and malformed
+// records, ensuring the manifest remains the source of recipient identity.
 func fakeResults(input []byte, scenario string) ([]byte, []byte, error) {
 	var outputs, errors [][]byte
 	var ids []string

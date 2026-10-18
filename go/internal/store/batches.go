@@ -11,6 +11,8 @@ import (
 	"github.com/temporal-sa/temporal-nexus-openai-batch/go/internal/model"
 )
 
+// boundedLimit keeps each recovery pass finite, even when callers supply an
+// invalid page size. Large runs are drained over repeated worker iterations.
 func boundedLimit(limit int) int {
 	if limit < 1 {
 		return 100
@@ -21,6 +23,9 @@ func boundedLimit(limit int) int {
 	return limit
 }
 
+// SealDue flushes collection windows even when no more requests arrive. Workers
+// skip run rows already locked by another worker or enrollment transaction,
+// rather than blocking the entire scan behind one busy run.
 func (s *Store) SealDue(ctx context.Context, mode, endpoint string, limit int) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -64,7 +69,9 @@ func (s *Store) SealDue(ctx context.Context, mode, endpoint string, limit int) (
 
 // ReadyBatches claims the durable dispatch outbox briefly. A crash before
 // starting Temporal work leaves the row available again after the lease; a
-// crash after starting is repaired by the deterministic workflow ID.
+// crash after starting is repaired by the deterministic workflow ID. The lease
+// limits duplicate dispatch work; it does not promise a single start attempt.
+// Only references and counts leave this method, never the batch's documents.
 func (s *Store) ReadyBatches(ctx context.Context, mode, endpoint string, limit int) ([]model.BatchRef, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -108,6 +115,8 @@ func (s *Store) ReadyBatches(ctx context.Context, mode, endpoint string, limit i
 	return refs, nil
 }
 
+// MarkDispatched acknowledges the outbox only after the dispatcher has started
+// or found the batch Workflow. A lost acknowledgment is safe to retry.
 func (s *Store) MarkDispatched(ctx context.Context, batchID string) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE nexus_batch_batches SET dispatched=true,dispatch_claim_until=NULL WHERE namespace=$1 AND batch_id=$2`, s.namespace, batchID)
 	if err != nil {
@@ -119,6 +128,10 @@ func (s *Store) MarkDispatched(ctx context.Context, batchID string) error {
 	return nil
 }
 
+// LoadManifest reconstructs a sealed batch inside an Activity. Repeatable-read
+// keeps its metadata and entries in one snapshot. Sealing freezes membership;
+// a recipient's target can still change when a newer SAA attempt reattaches.
+// The returned manifest is for worker memory and must not enter Workflow state.
 func (s *Store) LoadManifest(ctx context.Context, batchID string) (model.Manifest, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -165,6 +178,8 @@ func (s *Store) LoadManifest(ctx context.Context, batchID string) (model.Manifes
 	if err != nil {
 		return m, dbError("read entries", err)
 	}
+	// Revalidate the complete encoded upload, not only each admission. This
+	// catches an inconsistent stored batch before any provider side effect.
 	if _, err = model.JSONL(m); err != nil {
 		return m, fail("INVALID_BATCH", "stored batch violates configured bounds")
 	}
@@ -174,6 +189,9 @@ func (s *Store) LoadManifest(ctx context.Context, batchID string) (model.Manifes
 	return m, nil
 }
 
+// SaveReport stores the small batch summary separately from per-request
+// outcomes. Reaching a completed report does not prevent the independent keeper
+// from repairing a later recipient reattachment.
 func (s *Store) SaveReport(ctx context.Context, report model.BatchReport) error {
 	report.Diagnostics = boundedDiagnostics(report.Diagnostics)
 	raw, err := json.Marshal(report)
@@ -190,6 +208,8 @@ func (s *Store) SaveReport(ctx context.Context, report model.BatchReport) error 
 	return nil
 }
 
+// Status combines the Workflow's last saved report with current database
+// delivery checkpoints. It is a progress view, not a live OpenAI status poll.
 func (s *Store) Status(ctx context.Context, runID string) (model.RunStatus, error) {
 	status := model.RunStatus{RunID: runID, Backing: "nexus_standalone_activity", CompletionMode: "external_async_completion", Storage: "postgres", Batches: []model.BatchReport{}}
 	err := s.pool.QueryRow(ctx, `SELECT admitted,closed FROM nexus_batch_runs WHERE namespace=$1 AND run_id=$2`, s.namespace, runID).Scan(&status.Admitted, &status.Closed)

@@ -1,3 +1,11 @@
+-- PostgreSQL is the data plane: documents, completion targets, and outcomes stay
+-- here rather than growing Temporal Workflow histories. Every key includes the
+-- Temporal namespace so a worker cannot mix recipients from different namespaces.
+
+-- The run row is the admission/sealing/stop lock. Its open_batch_id and sequence
+-- choose one current collection window and stable IDs for later batch Workflows.
+-- closed flushes existing work; stopped additionally fences new submissions and
+-- suppresses pending delivery. Application transactions enforce those policies.
 CREATE TABLE IF NOT EXISTS nexus_batch_runs (
     namespace text NOT NULL,
     run_id text NOT NULL,
@@ -13,6 +21,10 @@ CREATE TABLE IF NOT EXISTS nexus_batch_runs (
     PRIMARY KEY (namespace, run_id)
 );
 
+-- Batch membership changes only while state is open. Sealing also publishes the
+-- dispatch outbox item; the dispatcher leases it until a stable Workflow start is
+-- acknowledged. outcomes_saved makes the first committed reconciliation final.
+-- Reports contain bounded summaries, while per-request data lives below.
 CREATE TABLE IF NOT EXISTS nexus_batch_batches (
     namespace text NOT NULL,
     batch_id text NOT NULL,
@@ -35,12 +47,22 @@ CREATE TABLE IF NOT EXISTS nexus_batch_batches (
     FOREIGN KEY (namespace, run_id) REFERENCES nexus_batch_runs(namespace, run_id)
 );
 
+-- Partial indexes support bounded recovery scans without walking finished work.
 CREATE INDEX IF NOT EXISTS nexus_batch_due ON nexus_batch_batches(namespace, mode, endpoint, seal_at)
     WHERE state = 'open';
 CREATE INDEX IF NOT EXISTS nexus_batch_outbox ON nexus_batch_batches(namespace, mode, endpoint, sealed_at)
     WHERE state = 'sealed' AND NOT dispatched;
 CREATE INDEX IF NOT EXISTS nexus_batch_run_batches ON nexus_batch_batches(namespace, run_id, batch_id);
 
+-- Each row has three roles: immutable manifest entry, mutable exact SAA recipient,
+-- and completion outbox item. A newer attempt of the same Activity execution may
+-- replace target, but it reuses the original membership, fingerprint, and outcome.
+-- The request key prevents duplicate admission; the Activity identity uniqueness
+-- constraint prevents one operation from owning several different requests.
+--
+-- target contains the completion token and must be treated as sensitive worker
+-- data. Delivery checkpoints compare the entire expected target before updating,
+-- so an older delivery attempt cannot consume a newer recipient's pending work.
 CREATE TABLE IF NOT EXISTS nexus_batch_requests (
     namespace text NOT NULL,
     run_id text NOT NULL,

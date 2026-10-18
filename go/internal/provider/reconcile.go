@@ -12,6 +12,9 @@ import (
 // Reconcile is pure: exactly one bounded terminal outcome is produced for every
 // manifest entry, including requests absent from malformed or partial files.
 // Results are matched exclusively by custom_id, never by file ordering.
+// Starting with failures ensures that a missing or unparseable provider record
+// cannot silently strand a recipient. Neither downloading nor completion occurs
+// here, so the same files and manifest always produce the same reconciliation.
 func Reconcile(manifest model.Manifest, job Job, output, errorFile []byte) ([]model.Outcome, []string) {
 	outcomes := make([]model.Outcome, len(manifest.Entries))
 	expected := make(map[string]int, len(manifest.Entries))
@@ -60,6 +63,8 @@ func Reconcile(manifest model.Manifest, job Job, output, errorFile []byte) ([]mo
 			}
 			seen[record.CustomID]++
 			if seen[record.CustomID] > 1 {
+				// Two records for one custom_id are conflicting evidence, even
+				// across the output and error files. Do not choose one arbitrarily.
 				outcomes[index].Result = nil
 				outcomes[index].Failure = &model.Failure{Code: "DUPLICATE_RESULT", Message: "provider returned multiple results for this request"}
 				diagnose(fmt.Sprintf("%s line %d duplicates a manifest request", file, lineNum+1))
@@ -91,6 +96,10 @@ type batchRecord struct {
 	} `json:"error"`
 }
 
+// normalize reduces a Responses record to the prototype's small text contract.
+// HTTP success is insufficient: the response must itself be completed, contain
+// output text, and fit the completion payload bound. Raw provider error text and
+// non-message output are intentionally excluded from caller-facing results.
 func normalize(record batchRecord) (*model.Result, *model.Failure) {
 	fail := func(code, message string) (*model.Result, *model.Failure) {
 		return nil, &model.Failure{Code: code, Message: message}

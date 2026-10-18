@@ -2,6 +2,8 @@
 
 The Go module, application source and tests live in this directory. Run the Make targets from the repository root; they share local PostgreSQL, Temporal and sample input with the Python application.
 
+Start with the [system diagram](../README.md#how-batching-works) and [architecture reading guide](../docs/architecture.md) to follow a request through Nexus, PostgreSQL, OpenAI and external Activity completion.
+
 | Path | Purpose |
 | --- | --- |
 | `cmd/batchctl/` | Command line application |

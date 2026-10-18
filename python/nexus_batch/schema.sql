@@ -1,4 +1,13 @@
 -- The Python service owns a separate database; this is its complete schema.
+-- PostgreSQL is the external buffer and recovery ledger. Large manifests and
+-- per-request completion capabilities never become batch Workflow payloads.
+-- Namespace is part of each identity so one database can separate Temporal
+-- namespaces. Mode and endpoint route background work to the matching workers.
+
+-- One configuration snapshot per run. Admission takes this row's lock before
+-- deciding membership, which serializes that decision within the run.
+-- closed rejects new requests and flushes a partial batch; stopped additionally
+-- fences future dispatch/submission and stops the keeper for this run.
 CREATE TABLE IF NOT EXISTS nexus_batch_runs (
     namespace text NOT NULL,
     run_id text NOT NULL,
@@ -13,6 +22,13 @@ CREATE TABLE IF NOT EXISTS nexus_batch_runs (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (namespace, run_id)
 );
+
+-- Collection progresses open -> sealed -> delivering -> completed. Sealing
+-- freezes membership and timestamps; only a small BatchRef crosses into Temporal.
+-- requests/bytes describe the uploaded JSONL, not the size of stored JSON.
+-- deadline_at is the earliest enrolled recipient deadline and may only shorten.
+-- dispatched + dispatch_claim_until form the leased Workflow-start outbox.
+-- outcomes_saved makes a retried results Activity keep its first committed set.
 CREATE TABLE IF NOT EXISTS nexus_batch_batches (
     namespace text NOT NULL,
     batch_id text NOT NULL,
@@ -34,11 +50,20 @@ CREATE TABLE IF NOT EXISTS nexus_batch_batches (
     PRIMARY KEY (namespace, batch_id),
     FOREIGN KEY (namespace, run_id) REFERENCES nexus_batch_runs(namespace, run_id)
 );
+-- Partial indexes keep window closing and dispatch scans focused on pending work.
 CREATE INDEX IF NOT EXISTS nexus_batch_due ON nexus_batch_batches(namespace, mode, endpoint, seal_at)
     WHERE state = 'open';
 CREATE INDEX IF NOT EXISTS nexus_batch_outbox ON nexus_batch_batches(namespace, mode, endpoint, sealed_at)
     WHERE state = 'sealed' AND NOT dispatched;
 CREATE INDEX IF NOT EXISTS nexus_batch_run_batches ON nexus_batch_batches(namespace, run_id, batch_id);
+
+-- One row per admitted logical request. request/fingerprint/batch/position and
+-- deadline retain the original admission; target can advance to a newer attempt
+-- of that same SAA execution without adding another manifest member.
+-- target contains an opaque task token and must be treated as a capability.
+-- outcome + delivery_status form the delivery outbox. A completion checkpoint
+-- compares the entire expected target to fence workers holding an older token.
+-- The two identity constraints prevent request-ID reuse and SAA-target reuse.
 CREATE TABLE IF NOT EXISTS nexus_batch_requests (
     namespace text NOT NULL,
     run_id text NOT NULL,
@@ -60,8 +85,11 @@ CREATE TABLE IF NOT EXISTS nexus_batch_requests (
     UNIQUE (namespace, activity_id, activity_run_id),
     FOREIGN KEY (namespace, batch_id) REFERENCES nexus_batch_batches(namespace, batch_id)
 );
+-- Manifest order is stable for upload, but provider output is joined by custom_id.
 CREATE INDEX IF NOT EXISTS nexus_batch_request_manifest ON nexus_batch_requests(namespace, batch_id, position);
 CREATE INDEX IF NOT EXISTS nexus_batch_pending_delivery ON nexus_batch_requests(namespace, batch_id, position)
     WHERE delivery_status = 'pending' AND outcome IS NOT NULL;
+-- The keeper claims due rows with SKIP LOCKED and postpones their next heartbeat;
+-- this index includes requests whose provider outcome is not available yet.
 CREATE INDEX IF NOT EXISTS nexus_batch_pending_heartbeat ON nexus_batch_requests(namespace, next_heartbeat_at)
     WHERE delivery_status = 'pending';

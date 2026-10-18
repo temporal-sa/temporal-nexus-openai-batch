@@ -1,4 +1,10 @@
-"""Single-attempt provider I/O and bounded, ID-based result reconciliation."""
+"""Provider adapters and the conversion from unordered files to caller outcomes.
+
+OpenAI Batch is a file/job protocol: upload JSONL, create one job, poll its state,
+then download output and error files. The fake adapter replaces only this I/O
+boundary; enrollment, Workflow orchestration, and SAA completion remain real.
+Reconciliation joins on custom_id, because file order is not request order.
+"""
 
 from __future__ import annotations
 
@@ -23,11 +29,15 @@ import httpx
 from .models import HARD_MAX_BATCH_BYTES, MAX_RESULT_BYTES, Failure, Manifest, Outcome, Result, Usage, dumps
 
 MAX_CONTROL_BYTES = 1024 * 1024
+# Listing is deliberately finite. Reaching this bound means lookup is uncertain,
+# not evidence that the original create failed and a replacement POST is safe.
 MAX_LIST_PAGES = 1000
 
 
 @dataclass
 class Job:
+    """Small provider control record; document text stays in separate files."""
+
     id: str
     status: str
     input_file_id: str = ""
@@ -41,6 +51,13 @@ class Job:
 
 @dataclass
 class ProviderError(Exception):
+    """Tell orchestration whether to retry reads or reconcile an uncertain POST.
+
+    ``permanent`` means retrying this rejected request is not useful.
+    ``ambiguous`` means a create may have succeeded despite the missing response.
+    These are distinct facts; an HTTP failure is not proof that no job exists.
+    """
+
     op: str
     code: str
     message: str
@@ -57,6 +74,8 @@ class ProviderError(Exception):
 
 
 class Provider(Protocol):
+    """External I/O seam shared by live HTTP and deterministic failure scenarios."""
+
     async def upload(self, batch_id: str, data: bytes) -> str: ...
     async def create(self, file_id: str, metadata: dict[str, str]) -> Job: ...
     async def find(self, metadata: dict[str, str]) -> list[Job]: ...
@@ -76,6 +95,8 @@ def _invalid_response(op: str, ambiguous: bool = False) -> ProviderError:
 
 
 def _job(value: Any, op: str, ambiguous: bool = False) -> Job:
+    # Validate control fields before returning them as Activity results. During
+    # create, a malformed response still cannot disprove an accepted submission.
     if not isinstance(value, dict) or not isinstance(value.get("id"), str) or not value["id"]:
         raise _invalid_response(op, ambiguous)
     if not isinstance(value.get("status"), str) or not value["status"]:
@@ -149,6 +170,12 @@ class OpenAIProvider:
         submission: bool = False,
         **kwargs: Any,
     ) -> bytes:
+        """Make one bounded request without logging secrets or provider bodies.
+
+        Redirects are disabled so Authorization stays on the configured endpoint.
+        Streamed size checks bound memory before a whole response is buffered.
+        Workflow/Activity policy supplies retries; this helper never hides them.
+        """
         try:
             async with self._client.stream(
                 method,
@@ -158,6 +185,9 @@ class OpenAIProvider:
                 **kwargs,
             ) as response:
                 if not 200 <= response.status_code < 300:
+                    # Retryable create failures, including transport/server
+                    # failures, are uncertain submissions rather than permission
+                    # for another paid create request.
                     permanent = 400 <= response.status_code < 500 and response.status_code not in {
                         408,
                         409,
@@ -199,6 +229,7 @@ class OpenAIProvider:
             raise _invalid_response(op, ambiguous) from None
 
     async def upload(self, batch_id: str, data: bytes) -> str:
+        """Store JSONL as a purpose=batch file before starting model processing."""
         if not data or len(data) > self._max_file_bytes:
             raise ProviderError(
                 "upload", "input_size", "input file is empty or exceeds configured size limit", permanent=True
@@ -216,6 +247,8 @@ class OpenAIProvider:
         return value["id"]
 
     async def create(self, file_id: str, metadata: dict[str, str]) -> Job:
+        # The endpoint must agree with each JSONL line. Upload alone is separate
+        # from submission; this POST is the point that creates the processing job.
         if not file_id:
             raise ProviderError("create", "input_file_missing", "input file ID is required", permanent=True)
         raw = await self._request(
@@ -237,6 +270,11 @@ class OpenAIProvider:
         return _job(self._json(raw, "retrieve"), "retrieve")
 
     async def find(self, metadata: dict[str, str]) -> list[Job]:
+        """Search every allowed page; the Activity additionally checks input_file_id.
+
+        This operation only observes jobs. Zero matches or multiple matches stay
+        ambiguous, and neither case causes this adapter to create a replacement.
+        """
         found, seen, after = [], set(), ""
         for _ in range(MAX_LIST_PAGES):
             params = {"limit": "100"}
@@ -262,6 +300,8 @@ class OpenAIProvider:
         )
 
     async def download(self, file_id: str) -> bytes:
+        # Output and error files share the same bounded download path. An absent
+        # file is allowed because a terminal job may have only one file or neither.
         if not file_id:
             return b""
         return await self._request(
@@ -315,6 +355,8 @@ class FakeProvider:
 
     @asynccontextmanager
     async def _locked(self) -> AsyncIterator[dict[str, Any]]:
+        # A process-local asyncio lock would not protect two worker processes.
+        # The file lock covers read/modify/write of the shared fake job catalog.
         with (self._dir / "lock").open("a+b") as lock:
             os.chmod(lock.name, 0o600)
             while True:
@@ -373,6 +415,8 @@ class FakeProvider:
                 "hidden": self._scenario == "submission-unreconciled",
             }
         if self._scenario in {"submission-unknown", "submission-unreconciled"}:
+            # Persist the job first, then simulate losing its acknowledgement.
+            # This exercises lookup recovery rather than simply rejecting POST.
             raise ProviderError(
                 "create", "submission_unknown", "simulated connection loss after submission", ambiguous=True
             )
@@ -421,6 +465,7 @@ class FakeProvider:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
+    """Publish a fully written fake-provider record instead of a partial JSON file."""
     descriptor, name = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -434,6 +479,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 
 def _fake_results(data: bytes, scenario: str) -> tuple[bytes, bytes]:
+    """Produce realistic success/error JSONL, including reconciliation edge cases."""
     outputs, errors, ids = [], [], []
     for line in data.splitlines():
         if not line.strip():
@@ -507,6 +553,8 @@ def _fake_results(data: bytes, scenario: str) -> tuple[bytes, bytes]:
             {"custom_id": ids[0], "response": {"status_code": 200, "body": {"status": "completed"}}}
         ).encode()
         outputs.append(b"{malformed JSON")
+    # Reverse success lines intentionally: correct delivery must use custom_id,
+    # and must never accidentally rely on the manifest's positional order.
     return b"\n".join(reversed(outputs)), b"\n".join(errors)
 
 
@@ -524,6 +572,8 @@ _STATUSES = {
 
 
 def _provider_failure(code: str, message: str, provider_code: Any) -> Failure:
+    # Preserve a bounded machine code, not arbitrary provider prose that could
+    # contain a document or expand the failure payload recorded by the caller.
     safe_code = (
         provider_code if isinstance(provider_code, str) and _MACHINE_CODE.fullmatch(provider_code) else ""
     )
@@ -533,6 +583,12 @@ def _provider_failure(code: str, message: str, provider_code: Any) -> Failure:
 
 
 def _normalize(record: dict[str, Any]) -> tuple[Result | None, Failure | None]:
+    """Reduce one provider record to bounded application text or an explicit failure.
+
+    A 2xx record alone is insufficient: the Responses body must be completed,
+    contain usable text, and fit the caller result limit. Refusal, incomplete
+    generation, malformed output, and provider errors stay distinct outcomes.
+    """
     error = record.get("error")
     if error is not None:
         raw_code = error.get("code", "") if isinstance(error, dict) else ""
@@ -596,7 +652,14 @@ def _normalize(record: dict[str, Any]) -> tuple[Result | None, Failure | None]:
 
 
 def reconcile(manifest: Manifest, job: Job, files: list[bytes]) -> tuple[list[Outcome], list[str]]:
-    """Produce exactly one bounded terminal outcome for each manifest request."""
+    """Produce exactly one bounded terminal outcome for each manifest request.
+
+    Begin with a failure for every expected member, then replace it only after
+    validating a uniquely matching custom_id. This makes partial provider files
+    explicit: missing, malformed, unknown, and duplicate rows cannot strand a
+    caller or deliver another document's response. The returned set is persisted
+    atomically by the results Activity before any external completion happens.
+    """
     missing_code = {"failed": "BATCH_FAILED", "cancelled": "BATCH_CANCELLED", "expired": "BATCH_EXPIRED"}.get(
         job.status, "MISSING_RESULT"
     )
@@ -644,6 +707,8 @@ def reconcile(manifest: Manifest, job: Job, files: list[bytes]) -> tuple[list[Ou
             seen[request_id] = seen.get(request_id, 0) + 1
             outcome = outcomes[expected[request_id]]
             if seen[request_id] > 1:
+                # Do not choose an arbitrary duplicate, even if the text matches.
+                # Subsequent duplicates must leave this request failed as well.
                 outcome.result = None
                 outcome.failure = Failure(
                     "DUPLICATE_RESULT", "provider returned multiple results for this request"

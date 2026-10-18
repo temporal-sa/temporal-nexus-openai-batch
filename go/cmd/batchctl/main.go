@@ -1,3 +1,6 @@
+// Command batchctl runs the prototype's workers and example callers. The CLI is
+// a launcher/inspector: PostgreSQL and Temporal retain the durable work after a
+// demo command stops waiting or its terminal is closed.
 package main
 
 import (
@@ -50,6 +53,9 @@ func env(k, d string) string {
 	}
 	return d
 }
+
+// Keep fake and live service work on separate queues and Nexus endpoints. A live
+// worker must not accidentally consume a fake run's provider work, or vice versa.
 func serviceQueue(mode string) string {
 	if mode == "live" {
 		return model.ServiceTaskQueue + "-live"
@@ -93,6 +99,8 @@ func initializeDatabase(args []string) error {
 	return printJSON(map[string]any{"store": "postgres", "namespace": conn.namespace, "schema": "ready"})
 }
 
+// capabilities inspects the server support required by the real SAA-backed
+// Nexus path; it does not infer support from whether an SDK symbol compiles.
 func capabilities(args []string) error {
 	f := flag.NewFlagSet("capabilities", flag.ContinueOnError)
 	var conn connection
@@ -141,6 +149,9 @@ func run(args []string) error {
 	}
 }
 
+// runWorker hosts three Temporal workers plus the store-backed dispatcher/keeper.
+// They share a process for this prototype, but their distinct queues make the
+// admission and bulk-work capacity choices explicit.
 func runWorker(args []string) error {
 	f := flag.NewFlagSet("worker", flag.ContinueOnError)
 	var conn connection
@@ -184,11 +195,16 @@ func runWorker(args []string) error {
 		return err
 	}
 	defer c.Close()
+	// Enrollment is short: the SAA writes its request/target to PostgreSQL and
+	// returns ErrResultPending. Bulk upload, polling and delivery have separate
+	// Activity slots so large batches cannot consume all admission capacity.
 	sw := worker.New(c, serviceQueue(*mode), worker.Options{MaxConcurrentActivityExecutionSize: *serviceSlots, WorkerStopTimeout: 5 * time.Second})
 	orchestration.RegisterService(sw, c, p, db)
 	batchQueue := serviceQueue(*mode) + "-batches"
 	bw := worker.New(c, batchQueue, worker.Options{MaxConcurrentActivityExecutionSize: *batchSlots, WorkerStopTimeout: 5 * time.Second})
 	orchestration.RegisterBatch(bw, c, p, db)
+	// This worker runs the demo's per-document business consumer. Applications
+	// can invoke the same Nexus operation from their own existing Workflows.
 	cw := worker.New(c, model.CallerTaskQueue, worker.Options{})
 	orchestration.RegisterCaller(cw)
 	if err = sw.Start(); err != nil {
@@ -204,6 +220,9 @@ func runWorker(args []string) error {
 	}
 	defer cw.Stop()
 	fmt.Fprintf(os.Stderr, "Workers ready: mode=%s service_queue=%s endpoint=%s store=postgres\n", *mode, serviceQueue(*mode), endpoint(*mode))
+	// The dispatcher seals due batches and starts their stable Workflow IDs;
+	// its independent keeper heartbeats pending SAAs and repairs completions.
+	// Durable store rows, rather than this channel, survive process failure.
 	dispatchErr := make(chan error, 1)
 	go func() {
 		dispatchErr <- orchestration.Dispatcher(ctx, c, db, *mode, batchQueue, endpoint(*mode))
@@ -220,6 +239,8 @@ func runWorker(args []string) error {
 	}
 }
 
+// itemReport describes what this launcher confirmed. "pending" means the CLI
+// wait expired without a confirmed terminal outcome; it is not a failed request.
 type itemReport struct {
 	RequestID  string        `json:"request_id"`
 	WorkflowID string        `json:"workflow_id"`
@@ -240,6 +261,9 @@ type demoReport struct {
 	Items       []itemReport    `json:"items"`
 }
 
+// runDemo creates a run and starts one CallerWorkflow per document. It does not
+// call OpenAI directly: the callers cross Nexus and the service combines their
+// requests into externally stored batches.
 func runDemo(args []string) error {
 	f := flag.NewFlagSet("demo", flag.ContinueOnError)
 	var conn connection
@@ -301,11 +325,16 @@ func runDemo(args []string) error {
 	}
 	defer db.Close()
 	start := time.Now()
+	// Run configuration must exist before ingress can authorize enrollment.
+	// A new ID makes each demo's admission scope and cleanup ownership explicit.
 	if err = db.CreateRun(ctx, model.RunInput{RunID: *id, Config: cfg}); err != nil {
 		return fmt.Errorf("create run (choose a new --run-id for each demo): %w", err)
 	}
 	report := demoReport{RunID: *id, Mode: *mode, Simulated: *mode == "fake", Items: make([]itemReport, len(reqs))}
 	var wg sync.WaitGroup
+	// Limit simultaneous start RPCs, then release the slot before waiting for a
+	// result. Holding it through Get would admit only 32 requests at a time and
+	// could prevent large batches from filling while the provider is processing.
 	sem := make(chan struct{}, 32)
 	for i, r := range reqs {
 		wg.Add(1)
@@ -340,6 +369,8 @@ func runDemo(args []string) error {
 		}
 	}
 	if ctx.Err() != nil || report.Pending > 0 {
+		// The launcher deadline only stops observation. It does not cancel the
+		// caller Workflows, their SAAs, or a submitted shared provider batch.
 		statusCtx, statusCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		refreshReportStatus(statusCtx, db, &report)
 		statusCancel()
@@ -347,6 +378,8 @@ func runDemo(args []string) error {
 		_ = printJSON(report)
 		return fmt.Errorf("CLI wait ended with %d unconfirmed outcome(s); Workflows continue durably; inspect run %s or cancel explicitly", report.Pending, *id)
 	}
+	// Closing admission also seals any remaining collection. It does not mean
+	// all batch bookkeeping has finished, so read stored reports until terminal.
 	if err = db.FinishRun(ctx, *id); err != nil {
 		report.Elapsed = time.Since(start)
 		_ = printJSON(report)
@@ -459,6 +492,9 @@ func documents(runID, path string, n int) ([]model.Request, error) {
 	return out, nil
 }
 
+// control separates closing admission (finish), observing progress (inspect),
+// canceling one consumer (cancel), and explicitly stopping a run (cleanup).
+// Canceling a consumer does not automatically cancel a shared upstream batch.
 func control(command string, args []string) error {
 	f := flag.NewFlagSet(command, flag.ContinueOnError)
 	var conn connection
@@ -496,6 +532,9 @@ func control(command string, args []string) error {
 			}
 			return printJSON(status)
 		}
+		// Stop admission/submission before reading owned resources. The store's
+		// submission fence orders this stop against a concurrent provider Create;
+		// visibility listing alone could miss not-yet-visible Temporal resources.
 		if err = db.StopRun(ctx, *id); err != nil {
 			var failure *model.Failure
 			if !errors.As(err, &failure) || failure.Code != "RUN_NOT_STARTED" {
@@ -546,6 +585,10 @@ func ownedWorkflow(id, runID string) bool {
 	}
 	return true
 }
+
+// cleanup uses stored exact identities first, then visibility as a supplemental
+// search. It closes this run's Temporal resources; it cannot undo provider work
+// already accepted, and it deliberately leaves upstream jobs/files in place.
 func cleanup(ctx context.Context, c client.Client, runID string, trackedBatches []string, trackedTargets []model.CompletionTarget) error {
 	q := fmt.Sprintf("ExecutionStatus = 'Running' AND (WorkflowId STARTS_WITH 'caller/%s/' OR WorkflowId STARTS_WITH 'batch/%s-')", runID, runID)
 	var ids []string

@@ -2,6 +2,8 @@
 
 This copy follows the same PostgreSQL → batch Workflow → external Activity completion flow as the Go application. It uses Python 3.11+, Temporal Python SDK 1.33.0, asyncpg and HTTPX. Nexus invokes a real Standalone Activity, which records its exact attempt token before calling `activity.raise_complete_async()`.
 
+Start with the [system diagram](../README.md#how-batching-works) and [architecture reading guide](../docs/architecture.md) for the request lifecycle, recovery rules and matching Go/Python source files.
+
 ## Run locally
 
 Start PostgreSQL and Temporal from the repository root:
@@ -85,7 +87,7 @@ python/.venv/bin/batchctl-python worker --mode fake --scenario mixed --state-dir
 
 Override the configured mode for a single CLI command with `--mode`, or for a Make target with `PYTHON_MODE`. Both the worker and its demo must select the same mode.
 
-Live mode uses the Responses Batch endpoint. Chat Completions support is on hold. The bounds and recovery semantics described in the [repository README](../README.md) apply to both applications.
+Live mode creates jobs through `/v1/batches` with `endpoint: "/v1/responses"`. Chat Completions support is on hold. The bounds and recovery semantics described in the [repository README](../README.md) apply to both applications.
 
 Standalone Activities are generally available in Python SDK 1.33.0; using them as Nexus operations remains experimental. [SDK release notes](https://github.com/temporalio/sdk-python/releases/tag/1.33.0)
 
