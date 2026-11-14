@@ -2,7 +2,25 @@
 
 The prototype turns independent Nexus requests into shared OpenAI batches. PostgreSQL holds the growing collections of requests and results. Temporal persists each caller's wait, the Nexus-backed Standalone Activity and the batch's control flow. The [system diagram](../README.md#how-batching-works) shows how these parts connect.
 
-Go and Python implement the same design. They run independently, with separate queues, Nexus endpoints and PostgreSQL databases. They share local development services and sample input.
+Go and Python implement the same single-request design. They run independently, with separate queues, Nexus endpoints and PostgreSQL databases. They share local development services and sample input. Python additionally supports bulk submissions through the `responses` Nexus operation.
+
+## Typed bulk submissions in Python
+
+The bulk interface submits one immutable manifest through one Nexus operation and one backing Standalone Activity. Application Activities write manifests and load results; application Workflows exchange references and counts. The [specification](combined-implementation-spec.md) describes the requirements.
+
+`BulkStore.write_input` stores ordered requests and a portable output schema in PostgreSQL. It seals the manifest with a content digest and rejects duplicate custom IDs. The Nexus input contains only run/submission identity and the manifest ID, digest and count. Submission IDs are unique within a Temporal namespace; use a run-derived or globally unique ID for each stage.
+
+The admission Activity validates every stored request, its digest and encoded provider line before admitting any work. A recipient ledger records its exact Activity attempt, original absolute deadline and admission cursor. Admission pages join the existing run's collection, so a provider batch can contain members of several bulk submissions alongside ordinary callers. Bulk membership rows have no per-item completion token. Their stable internal provider IDs keep identical custom IDs in separate submissions isolated.
+
+The existing `BatchWorkflow` remains the provider orchestration engine. Its results Activity stores bulk raw responses, parsed JSON and explicit parse errors alongside ordinary normalized results. Bulk outcomes stay external. Once admission is complete and every item has an outcome, the keeper creates a stable result-set reference and completes the bulk recipient's exact Activity attempt. It reconciles lost completion acknowledgements with that typed reference.
+
+Batch delivery counters continue to describe ordinary per-request Activity completions. Bulk members use the `stored` delivery state; their recipient's completion checkpoint lives in `nexus_batch_bulk_submissions`. A batch's request count therefore need not equal its ordinary delivery count. A retried results Activity returns committed outcome summaries before accessing provider files again.
+
+Partial snapshots record the exact outcome positions visible when the snapshot was created. Later results do not change an earlier reference. Admission retries preserve their cursor and original deadline. Cancelled or expired admission releases unused capacity reservations; cancelling a recipient leaves shared provider work running. A partial result reference remains available through `BulkStore.get_result(submission_id, partial=True)` in an Activity or administrative client.
+
+The service validates portable JSON Schema without importing caller classes or fetching remote schema references. Consumer Activities may apply a Pydantic model with additional Python validators. Those local failures preserve raw data and do not change the service's persisted aggregate counts.
+
+Bulk control messages retain the existing 8 KiB envelope bound. Each stored input item and raw provider response is limited to 1 MiB; schemas to 64 KiB; manifests to 100,000 items or 256 MiB; pages to 1,000 items and a 4 MiB byte budget. Manifests can span multiple provider batches. Upload/result Activities still materialize bounded provider files in memory. This is explicit PostgreSQL artifact storage, and producers, service workers and consumers need access to that namespace-scoped database. Retention and provider-file deletion remain manual; no files are deleted before durable outcome storage.
 
 ## Follow one request
 

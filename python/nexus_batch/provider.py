@@ -26,7 +26,17 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .models import HARD_MAX_BATCH_BYTES, MAX_RESULT_BYTES, Failure, Manifest, Outcome, Result, Usage, dumps
+from .models import (
+    HARD_MAX_BATCH_BYTES,
+    MAX_RESULT_BYTES,
+    Failure,
+    Manifest,
+    Outcome,
+    Request,
+    Result,
+    Usage,
+    dumps,
+)
 
 MAX_CONTROL_BYTES = 1024 * 1024
 # Listing is deliberately finite. Reaching this bound means lookup is uncertain,
@@ -486,8 +496,13 @@ def _fake_results(data: bytes, scenario: str) -> tuple[bytes, bytes]:
             continue
         try:
             request = json.loads(line)
-            request_id, text = request["custom_id"], request["body"]["input"]
-            if not isinstance(request_id, str) or not request_id or not isinstance(text, str):
+            request_id, body = request["custom_id"], request["body"]
+            if not isinstance(body, dict):
+                raise ValueError()
+            text = body.get("input", body.get("instructions", ""))
+            if not isinstance(text, str):
+                text = dumps(text)
+            if not isinstance(request_id, str) or not request_id or not isinstance(body, dict):
                 raise ValueError()
         except (KeyError, TypeError, ValueError, UnicodeError):
             raise ProviderError(
@@ -513,6 +528,11 @@ def _fake_results(data: bytes, scenario: str) -> tuple[bytes, bytes]:
             continue
         if len(text.encode()) > 256:
             text = text[:128]
+        text_format = (body.get("text") or {}).get("format") or {}
+        schema = text_format.get("schema") if text_format.get("type") == "json_schema" else None
+        output_text = (
+            dumps(_fake_structured(schema, text)) if isinstance(schema, dict) else "Fake response: " + text
+        )
         outputs.append(
             dumps(
                 {
@@ -529,7 +549,7 @@ def _fake_results(data: bytes, scenario: str) -> tuple[bytes, bytes]:
                                 {
                                     "type": "message",
                                     "role": "assistant",
-                                    "content": [{"type": "output_text", "text": "Fake response: " + text}],
+                                    "content": [{"type": "output_text", "text": output_text}],
                                 }
                             ],
                             "usage": {"input_tokens": 12, "output_tokens": 20},
@@ -558,6 +578,51 @@ def _fake_results(data: bytes, scenario: str) -> tuple[bytes, bytes]:
     return b"\n".join(reversed(outputs)), b"\n".join(errors)
 
 
+def _fake_structured(schema: dict[str, Any], text: str, root: dict[str, Any] | None = None, depth=0) -> Any:
+    """Small deterministic schema fixture generator, never used by live requests."""
+    root = schema if root is None else root
+    if depth > 32:
+        return None
+    if "$ref" in schema:
+        target: Any = root
+        if schema["$ref"] != "#":
+            for part in schema["$ref"].removeprefix("#/").split("/"):
+                target = target[part.replace("~1", "/").replace("~0", "~")]
+        return _fake_structured(target, text, root, depth + 1)
+    if "const" in schema:
+        return schema["const"]
+    if "enum" in schema:
+        choices = schema["enum"]
+        negative = any(word in text.lower() for word in ("bad", "negative", "broken", "unhappy", "terrible"))
+        desired = {"negative", "neg"} if negative else {"positive", "pos"}
+        return next((value for value in choices if isinstance(value, str) and value in desired), choices[0])
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if variants:
+        variant = next((item for item in variants if item.get("type") != "null"), variants[0])
+        return _fake_structured(variant, text, root, depth + 1)
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((item for item in kind if item != "null"), "null")
+    if kind == "object" or "properties" in schema:
+        return {
+            name: _fake_structured(child, text, root, depth + 1)
+            for name, child in schema.get("properties", {}).items()
+        }
+    if kind == "array":
+        return [_fake_structured(schema.get("items", {}), text, root, depth + 1)] * min(
+            4, max(0, schema.get("minItems", 0))
+        )
+    if kind == "boolean":
+        return False
+    if kind in {"integer", "number"}:
+        return schema.get("minimum", 0)
+    if kind == "null":
+        return None
+    value = "Fake response: " + text
+    value = value[: schema.get("maxLength", 256)]
+    return value.ljust(min(256, schema.get("minLength", 0)), "x")
+
+
 _MACHINE_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _STATUSES = {
     "completed",
@@ -582,7 +647,9 @@ def _provider_failure(code: str, message: str, provider_code: Any) -> Failure:
     return Failure(code, message, safe_code)
 
 
-def _normalize(record: dict[str, Any]) -> tuple[Result | None, Failure | None]:
+def _normalize(
+    record: dict[str, Any], *, max_result_bytes: int = MAX_RESULT_BYTES, require_text: bool = True
+) -> tuple[Result | None, Failure | None]:
     """Reduce one provider record to bounded application text or an explicit failure.
 
     A 2xx record alone is insufficient: the Responses body must be completed,
@@ -592,7 +659,9 @@ def _normalize(record: dict[str, Any]) -> tuple[Result | None, Failure | None]:
     error = record.get("error")
     if error is not None:
         raw_code = error.get("code", "") if isinstance(error, dict) else ""
-        code = "BATCH_EXPIRED" if raw_code == "batch_expired" else "PROVIDER_REQUEST_ERROR"
+        code = {"batch_expired": "BATCH_EXPIRED", "batch_cancelled": "BATCH_CANCELLED"}.get(
+            raw_code, "PROVIDER_REQUEST_ERROR"
+        )
         return None, _provider_failure(code, "provider could not complete this request", raw_code)
     response = record.get("response")
     if not isinstance(response, dict):
@@ -616,6 +685,8 @@ def _normalize(record: dict[str, Any]) -> tuple[Result | None, Failure | None]:
     if body.get("status") != "completed":
         return None, Failure("INCOMPLETE_RESULT", "provider response did not complete")
     text = []
+    if not require_text and "output" not in body:
+        return None, Failure("INVALID_RESULT", "provider response body is malformed")
     output = body.get("output") or []
     if not isinstance(output, list):
         return None, Failure("INVALID_RESULT", "provider response body is malformed")
@@ -634,7 +705,7 @@ def _normalize(record: dict[str, Any]) -> tuple[Result | None, Failure | None]:
                 if not isinstance(part.get("text"), str):
                     return None, Failure("INVALID_RESULT", "provider response body is malformed")
                 text.append(part["text"])
-    if not text or not "".join(text):
+    if require_text and (not text or not "".join(text)):
         return None, Failure("INVALID_RESULT", "provider response contains no output text")
     usage = None
     if body.get("usage") is not None:
@@ -646,9 +717,85 @@ def _normalize(record: dict[str, Any]) -> tuple[Result | None, Failure | None]:
             return None, Failure("INVALID_RESULT", "provider response contains invalid token usage")
         usage = Usage(*counts)
     result = Result(record["custom_id"], "".join(text), usage)
-    if len(dumps(result).encode()) > MAX_RESULT_BYTES:
-        return None, Failure("RESULT_TOO_LARGE", "normalized provider result exceeds 4 KiB")
+    if len(dumps(result).encode()) > max_result_bytes:
+        bound = "4 KiB" if max_result_bytes == MAX_RESULT_BYTES else "its byte limit"
+        return None, Failure("RESULT_TOO_LARGE", f"normalized provider result exceeds {bound}")
     return result, None
+
+
+def _bulk_normalize(
+    record: dict[str, Any], request: Request
+) -> tuple[Result | None, Failure | None, dict[str, Any]]:
+    from .bulk_models import MAX_BULK_ITEM_BYTES, canonical_json, schema_validator, validate_schema
+
+    response = record.get("response")
+    raw = response.get("body") if isinstance(response, dict) else None
+    raw = raw if isinstance(raw, dict) else None
+    try:
+        if raw is not None and len(canonical_json(raw)) > MAX_BULK_ITEM_BYTES:
+            return None, Failure("RESULT_TOO_LARGE", "bulk response body exceeds 1 MiB"), {"status": "failed"}
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return (
+            None,
+            Failure("INVALID_RESULT", "provider response contains invalid JSON values"),
+            {"status": "failed"},
+        )
+    # Admission validates this shape. Still turn a corrupt stored body into a
+    # terminal item failure instead of raising in the results Activity forever.
+    text_config = (request.body or {}).get("text", {})
+    text_format = text_config.get("format", {}) if isinstance(text_config, dict) else None
+    if not isinstance(text_format, dict):
+        return (
+            None,
+            Failure("INVALID_RESULT", "stored request output format is malformed"),
+            {"status": "failed", "response": raw},
+        )
+    typed = text_format.get("type") == "json_schema"
+    result, failure = _normalize(record, max_result_bytes=MAX_BULK_ITEM_BYTES, require_text=typed)
+    provider_error = record.get("error")
+    if provider_error is not None and not isinstance(provider_error, dict):
+        provider_error = {"value": provider_error}
+    try:
+        if provider_error is not None and len(canonical_json(provider_error)) > MAX_BULK_ITEM_BYTES:
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return (
+            None,
+            Failure("INVALID_RESULT", "provider error exceeds its JSON or size bound"),
+            {"status": "failed"},
+        )
+    details: dict[str, Any] = {
+        "status": "failed",
+        "response": raw,
+        "output": None,
+        "parse_error": "",
+        "provider_error": provider_error,
+    }
+    if failure:
+        details["status"] = {"BATCH_EXPIRED": "expired", "BATCH_CANCELLED": "cancelled"}.get(
+            failure.code, "failed"
+        )
+        return None, failure, details
+    details["status"] = "succeeded"
+    if typed:
+        try:
+            schema = validate_schema(text_format.get("schema"))
+            if schema is None:
+                raise ValueError("structured output schema is missing")
+            parsed = json.loads(result.text)
+            canonical_json(parsed)  # Reject NaN/Infinity accepted by Python's permissive JSON parser.
+            schema_validator(schema).validate(parsed)
+            details["output"] = parsed
+        except Exception as exc:
+            # Validation exceptions may embed the entire generated value. This
+            # diagnostic is external, but keep it bounded and preserve raw data.
+            details["status"] = "parse_failed"
+            details["parse_error"] = str(exc).encode()[:2048].decode(errors="ignore")
+    else:
+        details["output"] = raw
+    # The text and full response already live in details. This small result is
+    # only the successful-terminal marker used by shared batch bookkeeping.
+    return Result(result.request_id, "", result.usage), None, details
 
 
 def reconcile(manifest: Manifest, job: Job, files: list[bytes]) -> tuple[list[Outcome], list[str]]:
@@ -672,12 +819,26 @@ def reconcile(manifest: Manifest, job: Job, files: list[bytes]) -> tuple[list[Ou
             failure=Failure(
                 missing_code, f"provider did not return a result for this request (batch status: {status})"
             ),
+            bulk=(
+                {
+                    "status": {"BATCH_EXPIRED": "expired", "BATCH_CANCELLED": "cancelled"}.get(
+                        missing_code, "failed"
+                    )
+                }
+                if entry.request.bulk_id
+                else None
+            ),
         )
         for entry in manifest.entries
     ]
     expected = {entry.request.request_id: index for index, entry in enumerate(manifest.entries)}
     seen: dict[str, int] = {}
     diagnostics: list[str] = []
+    # Leave wrapper headroom around the 1 MiB raw bulk response bound. Legacy
+    # requests retain their existing, smaller JSONL-record admission policy.
+    line_limit = MAX_CONTROL_BYTES + (
+        64 * 1024 if any(entry.request.bulk_id for entry in manifest.entries) else 0
+    )
 
     def diagnose(message: str) -> None:
         if len(diagnostics) < 100:
@@ -690,7 +851,7 @@ def reconcile(manifest: Manifest, job: Job, files: list[bytes]) -> tuple[list[Ou
         for line_number, line in enumerate(data.split(b"\n"), 1):
             if not line.strip():
                 continue
-            if len(line) > MAX_CONTROL_BYTES:
+            if len(line) > line_limit:
                 diagnose(f"{name} line {line_number} exceeds JSONL line limit")
                 continue
             try:
@@ -713,9 +874,15 @@ def reconcile(manifest: Manifest, job: Job, files: list[bytes]) -> tuple[list[Ou
                 outcome.failure = Failure(
                     "DUPLICATE_RESULT", "provider returned multiple results for this request"
                 )
+                if outcome.bulk is not None:
+                    outcome.bulk = {"status": "failed", "response": None, "output": None, "parse_error": ""}
                 diagnose(f"{name} line {line_number} duplicates a manifest request")
             else:
-                outcome.result, outcome.failure = _normalize(record)
+                entry = manifest.entries[expected[request_id]]
+                if entry.request.bulk_id:
+                    outcome.result, outcome.failure, outcome.bulk = _bulk_normalize(record, entry.request)
+                else:
+                    outcome.result, outcome.failure = _normalize(record)
     for outcome in outcomes:
         if not seen.get(outcome.request_id):
             diagnose("manifest request missing from provider result files")

@@ -93,3 +93,90 @@ CREATE INDEX IF NOT EXISTS nexus_batch_pending_delivery ON nexus_batch_requests(
 -- this index includes requests whose provider outcome is not available yet.
 CREATE INDEX IF NOT EXISTS nexus_batch_pending_heartbeat ON nexus_batch_requests(namespace, next_heartbeat_at)
     WHERE delivery_status = 'pending';
+
+-- Bulk manifests are immutable external artifacts. Their contents and portable
+-- output schemas never cross the Nexus/Workflow boundary.
+CREATE TABLE IF NOT EXISTS nexus_batch_bulk_inputs (
+    namespace text NOT NULL,
+    manifest_id text NOT NULL,
+    digest text NOT NULL DEFAULT '',
+    item_count integer NOT NULL DEFAULT 0,
+    bytes bigint NOT NULL DEFAULT 0,
+    output_schema jsonb,
+    sealed boolean NOT NULL DEFAULT false,
+    PRIMARY KEY(namespace, manifest_id)
+);
+CREATE TABLE IF NOT EXISTS nexus_batch_bulk_input_items (
+    namespace text NOT NULL,
+    manifest_id text NOT NULL,
+    position integer NOT NULL,
+    custom_id text NOT NULL,
+    body jsonb NOT NULL,
+    bytes integer NOT NULL,
+    PRIMARY KEY(namespace, manifest_id, position),
+    UNIQUE(namespace, manifest_id, custom_id),
+    FOREIGN KEY(namespace, manifest_id) REFERENCES nexus_batch_bulk_inputs(namespace, manifest_id)
+        ON DELETE CASCADE
+);
+
+-- One exact asynchronous completion recipient for an entire bulk submission.
+CREATE TABLE IF NOT EXISTS nexus_batch_bulk_submissions (
+    namespace text NOT NULL,
+    submission_id text NOT NULL,
+    run_id text NOT NULL,
+    input_ref jsonb NOT NULL,
+    target jsonb NOT NULL,
+    activity_id text NOT NULL,
+    activity_run_id text NOT NULL,
+    deadline_at timestamptz NOT NULL,
+    admitted integer NOT NULL DEFAULT 0,
+    admission_complete boolean NOT NULL DEFAULT false,
+    result_ref jsonb,
+    delivery_status text NOT NULL DEFAULT 'pending',
+    delivery_diagnostic text NOT NULL DEFAULT '',
+    next_heartbeat_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY(namespace, submission_id),
+    UNIQUE(namespace, activity_id, activity_run_id),
+    FOREIGN KEY(namespace, run_id) REFERENCES nexus_batch_runs(namespace, run_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS nexus_batch_bulk_pending ON nexus_batch_bulk_submissions(namespace,run_id)
+    WHERE delivery_status='pending';
+
+-- Snapshots retain metadata and visible item positions, not copies of raw
+-- outcomes. An earlier partial reference remains stable as more results arrive.
+CREATE TABLE IF NOT EXISTS nexus_batch_bulk_snapshots (
+    namespace text NOT NULL,
+    submission_id text NOT NULL,
+    digest text NOT NULL,
+    as_of timestamptz NOT NULL,
+    reference jsonb NOT NULL,
+    PRIMARY KEY(namespace,submission_id,digest),
+    FOREIGN KEY(namespace,submission_id)
+        REFERENCES nexus_batch_bulk_submissions(namespace,submission_id) ON DELETE CASCADE
+);
+
+-- These additive migrations also upgrade an existing single-request database.
+ALTER TABLE nexus_batch_requests ADD COLUMN IF NOT EXISTS bulk_id text;
+ALTER TABLE nexus_batch_requests ADD COLUMN IF NOT EXISTS bulk_position integer;
+ALTER TABLE nexus_batch_requests ADD COLUMN IF NOT EXISTS outcome_saved_at timestamptz;
+ALTER TABLE nexus_batch_requests ALTER COLUMN target DROP NOT NULL;
+ALTER TABLE nexus_batch_requests ALTER COLUMN activity_id DROP NOT NULL;
+ALTER TABLE nexus_batch_requests ALTER COLUMN activity_run_id DROP NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS nexus_batch_bulk_positions
+    ON nexus_batch_requests(namespace,bulk_id,bulk_position) WHERE bulk_id IS NOT NULL;
+
+ALTER TABLE nexus_batch_runs ADD COLUMN IF NOT EXISTS reserved bigint NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS nexus_batch_bulk_snapshot_items (
+    namespace text NOT NULL,
+    submission_id text NOT NULL,
+    digest text NOT NULL,
+    position integer NOT NULL,
+    PRIMARY KEY(namespace,submission_id,digest,position),
+    FOREIGN KEY(namespace,submission_id,digest)
+        REFERENCES nexus_batch_bulk_snapshots(namespace,submission_id,digest) ON DELETE CASCADE
+);
+ALTER TABLE nexus_batch_bulk_submissions
+    ADD COLUMN IF NOT EXISTS admission_aborted boolean NOT NULL DEFAULT false;
+ALTER TABLE nexus_batch_bulk_input_items
+    ADD COLUMN IF NOT EXISTS content_digest text NOT NULL DEFAULT '';

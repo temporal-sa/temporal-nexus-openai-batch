@@ -92,3 +92,117 @@ Live mode creates jobs through `/v1/batches` with `endpoint: "/v1/responses"`. C
 Standalone Activities are generally available in Python SDK 1.33.0; using them as Nexus operations remains experimental. [SDK release notes](https://github.com/temporalio/sdk-python/releases/tag/1.33.0)
 
 See [testing instructions](../docs/testing.md) for unit, PostgreSQL and real Temporal tests. Throughput needs to be measured for this implementation independently.
+
+## Typed bulk pipelines
+
+The Python service also exposes `llm-batch.responses`. One bulk submission starts
+one Nexus operation and one backing Standalone Activity. Its items join the same
+run's count, byte, and collection-window batching as ordinary `respond` callers.
+Submitting 1,000 items does not start 1,000 Nexus operations. The new bulk API is
+Python-only; the existing Go and Python single-request APIs keep their contracts.
+
+An application Activity writes an immutable manifest with explicit custom IDs:
+
+```python
+from pydantic import BaseModel
+from nexus_batch.bulk import BulkRequest, write_requests
+from nexus_batch.bulk_store import BulkStore
+
+
+class Sentiment(BaseModel):
+    label: str
+
+
+# Inside an Activity; store is the service's namespace-scoped Store.
+requests = await write_requests(
+    BulkStore(store),
+    (BulkRequest(str(row.id), {"input": row.text}) for row in rows),
+    output_type=Sentiment,
+)
+```
+
+The writer accepts synchronous and asynchronous iterables. It stores the strict
+JSON Schema alongside the input and returns only an ID, digest, and count. An
+empty iterable or duplicate custom ID is invalid. The run selects the model;
+individual request bodies can preserve Responses fields such as `instructions`,
+structured `input`, and output options. A supplied model must match the run and
+streaming requests are rejected.
+
+The application Workflow passes that reference through one operation:
+
+```python
+from datetime import timedelta
+from nexus_batch.bulk import responses
+
+results = await responses(
+    run_id="reviews-2026-11-14",
+    submission_id="reviews-2026-11-14-classify",
+    requests=requests,
+    endpoint="llm-batch-python",
+    operation_timeout=timedelta(hours=26),
+)
+```
+
+Create the run and its immutable configuration before starting the Workflow, as
+in the existing CLI. Submission IDs are unique within the database's Temporal
+namespace. Separate submissions may reuse item custom IDs; the service assigns
+distinct provider identities. Retries of an operation reattach to its original
+membership and deadline rather than admitting another copy.
+
+Consumer Activities load pages or iterate without putting results into Workflow
+history:
+
+```python
+from nexus_batch.bulk import iter_results
+
+async for item in iter_results(BulkStore(store), results, output_type=Sentiment):
+    if item.ok:
+        await db.upsert_sentiment(item.custom_id, item.output.label)
+    else:
+        # item.request, item.response, item.error, and item.parse_error preserve
+        # material for inspection or a deliberate repair operation.
+        await db.record_failure(item.custom_id, item.status, item.parse_error)
+```
+
+The service validates portable JSON Schema, without importing application
+classes. Consumer Activities apply the supplied Pydantic model, including custom
+Python validators. A local validation failure has `status="parse_failed"` and a
+`parse_error` beginning with `local validation:`; it preserves the raw material
+and does not change service aggregate counts. Omitting `output_type` when writing
+and loading selects raw mode. `unfinished_requests(store, results)` can write a
+new manifest of expired or cancelled items and returns `None` when none exist;
+it preserves the original portable schema unless an explicit `output_type`
+replaces it. Submitting that manifest is an explicit new operation.
+
+`load_page(store, results, offset=0, limit=100)` returns items plus `next_offset`.
+Continue with that offset: the byte bound can shorten a page before its item
+limit. Request items are limited to 1 MiB, stored outcomes to 3 MiB, schema
+documents to 64 KiB, and pages to 1,000 items and 4 MiB. References have constant
+size as item count grows. One input manifest is limited to 100,000 items and
+256 MiB. Bounded Workflow payloads do not eliminate Activity
+memory use: provider Activities still materialize a configured, bounded provider
+batch. All producers, service workers, and consumers need access to the same
+namespace-scoped PostgreSQL store. Retention and provider-file cleanup remain
+operator responsibilities.
+
+Cancellation detaches that recipient and leaves other recipients' shared
+provider work intact. Persisted partial outcomes remain available through
+`await BulkStore(store).get_result(submission_id, partial=True)` in an Activity;
+a cancelled Nexus operation does not return a normal result reference.
+
+### Two-stage example
+
+With PostgreSQL and Temporal running, stop other Python fake workers on the same
+queues and run:
+
+```sh
+uv run --project python python -m nexus_batch.examples.review_replies.run --count 12
+```
+
+This command hosts the service and application workers, uses the persistent fake
+provider, and creates a new run automatically. It classifies the reviews, selects
+negative reviews in an Activity, and submits a second bulk manifest to draft
+replies. Its final JSON contains aggregate counts and result references; stored
+requests and replies remain in PostgreSQL. No OpenAI key is required, even when
+the repository `.env` selects live mode. Pass `--count 2000` for a larger run or
+`--run-id` to choose a new explicit identity.

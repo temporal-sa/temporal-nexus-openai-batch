@@ -43,3 +43,11 @@ CLI subprocesses in the integration tests explicitly select fake mode, even when
 Integration tests own the Python task queues; stop `python-worker` first. They exercise real Nexus callbacks and inspect the backing Standalone Activities. Provider scenarios include success, per-request errors, expiry, missing/duplicate/unknown/malformed output, and ambiguous submissions. Recovery checks use persisted fake-provider state and real process loss.
 
 Both implementations use bounded manifests in Activity memory and PostgreSQL. Passing local correctness tests does not establish production throughput, maximum-size batch performance, live provider latency, retention behavior or provider-file cleanup. Paid OpenAI submissions are outside the automated suites.
+
+## Combined Python bulk API
+
+The default Python suite includes client, wire-conversion, schema/provider, and exact-attempt completion tests. `make python-test-store` also runs bulk manifest/admission/snapshot tests against PostgreSQL. `make python-test-integration` includes the bulk Nexus suite alongside the existing single-request suite.
+
+The bulk integration tests exercise shared batches across bulk and ordinary recipients, repeated custom IDs in separate submissions, local Pydantic validation, provider error/expiry/malformed-output scenarios, uncertain submissions, and recovery after a worker process dies during paginated admission. A 120-item call checks one Nexus operation and one recipient, large external input/output, and workflow payloads no larger than 8 KiB in that scenario.
+
+Run the two-stage fake-provider application with `make python-bulk-demo`. It owns its worker pools, so stop another Python fake-mode worker first. The example uses real Temporal and PostgreSQL and returns counts and external references for classification, negative-review selection, and reply drafting. It performs no paid OpenAI calls.

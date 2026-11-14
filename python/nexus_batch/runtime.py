@@ -17,6 +17,7 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.worker import Worker
 
 from .activities import Activities
+from .bulk_activities import BulkActivities
 from .models import CALLER_TASK_QUEUE, SERVICE_TASK_QUEUE, NEXUS_ENDPOINT, workflow_id
 from .nexus_service import BatchService
 from .provider import Provider
@@ -103,6 +104,17 @@ async def maintain_enrollments(activities: Activities, mode: str, endpoint: str)
             await asyncio.sleep(1)
 
 
+async def maintain_bulk(activities: BulkActivities, mode: str, endpoint: str) -> None:
+    """Recover bulk recipient heartbeats and completion independently of admission."""
+    while True:
+        try:
+            heartbeats, completions = await activities.maintain_once(mode, endpoint)
+            await asyncio.sleep(0 if heartbeats == 100 or completions == 100 else 0.1)
+        except Exception:
+            logger.warning("bulk keeper unavailable; persisted recipients will retry")
+            await asyncio.sleep(1)
+
+
 @asynccontextmanager
 async def running_workers(
     client: Client,
@@ -120,11 +132,12 @@ async def running_workers(
     """
     caller_queue, service_queue, batch_queue, endpoint = queues(mode)
     activities = Activities(client, store, provider)
+    bulk_activities = BulkActivities(client, store, activities)
     caller = Worker(client, task_queue=caller_queue, workflows=[CallerWorkflow])
     service = Worker(
         client,
         task_queue=service_queue,
-        activities=[activities.submit_request],
+        activities=[activities.submit_request, bulk_activities.submit_bulk],
         nexus_service_handlers=[BatchService(store, endpoint)],
         max_concurrent_activities=service_concurrency,
         graceful_shutdown_timeout=timedelta(seconds=5),
@@ -150,6 +163,7 @@ async def running_workers(
         background = [
             asyncio.create_task(dispatcher(client, store, mode, endpoint, batch_queue)),
             asyncio.create_task(maintain_enrollments(activities, mode, endpoint)),
+            asyncio.create_task(maintain_bulk(bulk_activities, mode, endpoint)),
         ]
         try:
             yield

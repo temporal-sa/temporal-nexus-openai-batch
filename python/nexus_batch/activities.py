@@ -12,6 +12,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from typing import Any
 
 from temporalio import activity
 from temporalio.client import ActivityExecutionStatus, Client
@@ -52,6 +53,14 @@ class CreateResult:
 class DeliveryResult:
     delivered: bool = False
     diagnostic: str = ""
+
+
+@dataclass
+class CompletionValue:
+    """A persisted recipient result, independent of per-item provider outcomes."""
+
+    result: Any = None
+    failure: Failure | None = None
 
 
 def application_failure(failure: Failure) -> ApplicationError:
@@ -229,6 +238,8 @@ class Activities:
         Save all outcomes atomically first, so a crash during delivery can resume
         without downloading or interpreting provider results differently.
         """
+        if await self.store.outcomes_saved(ref.batch_id):
+            return await self.store.delivery_summary(ref.batch_id)
         manifest = await self.store.load_manifest(ref.batch_id)
         try:
             files = [
@@ -270,7 +281,9 @@ class Activities:
                         result.diagnostic,
                     )
 
-    async def complete(self, target: CompletionTarget, outcome: Outcome) -> DeliveryResult:
+    async def complete(
+        self, target: CompletionTarget, outcome: Outcome | CompletionValue, result_type: type = Result
+    ) -> DeliveryResult:
         """Complete the recorded execution and attempt, never a replacement SAA.
 
         The task token authorizes completion, while the explicit identity and
@@ -301,7 +314,7 @@ class Activities:
         ):
             return DeliveryResult(diagnostic="completion target identity did not match")
         if description.status not in (ActivityExecutionStatus.RUNNING, ActivityExecutionStatus.PAUSED):
-            return await self._reconcile_completion(description, outcome)
+            return await self._reconcile_completion(description, outcome, result_type)
         if description.attempt != target.attempt:
             return DeliveryResult(diagnostic="completion target has a superseding attempt")
         async_handle = self.client.get_async_activity_handle(task_token=target.task_token)
@@ -327,10 +340,12 @@ class Activities:
                 if inspect_exc.status == RPCStatusCode.NOT_FOUND:
                     return DeliveryResult(diagnostic="completion target no longer exists")
                 raise
-            return await self._reconcile_completion(description, outcome)
+            return await self._reconcile_completion(description, outcome, result_type)
 
     @staticmethod
-    async def _reconcile_completion(description, outcome: Outcome) -> DeliveryResult:
+    async def _reconcile_completion(
+        description, outcome: Outcome | CompletionValue, result_type: type = Result
+    ) -> DeliveryResult:
         """Confirm a lost acknowledgement by comparing the actual closed outcome.
 
         Merely observing that an Activity closed is insufficient: cancellation or
@@ -338,7 +353,7 @@ class Activities:
         """
         try:
             if description.status == ActivityExecutionStatus.COMPLETED and outcome.result:
-                if await description.result(Result) == outcome.result:
+                if await description.result(result_type) == outcome.result:
                     return DeliveryResult(delivered=True)
             if description.status == ActivityExecutionStatus.FAILED and outcome.failure:
                 previous = await description.outcome_failure()

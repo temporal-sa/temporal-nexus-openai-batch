@@ -44,7 +44,7 @@ inspect: build
 clean:
 	@echo 'Run bash go/scripts/cleanup.sh RUN_ID to cancel only one prototype run; see README.'
 
-.PHONY: python-install python-init python-setup python-worker python-demo python-test python-test-store python-test-workflows python-test-integration
+.PHONY: python-install python-init python-setup python-worker python-demo python-bulk-demo python-test python-test-store python-test-workflows python-test-integration
 python-install:
 	uv sync --project python --extra test
 python-init:
@@ -55,13 +55,15 @@ python-worker:
 	$(PYTHON) -m nexus_batch worker $(PYTHON_MODE_FLAG)
 python-demo:
 	$(PYTHON) -m nexus_batch demo $(PYTHON_MODE_FLAG) --run-id python-$$(date +%s) --input samples/documents.jsonl
+python-bulk-demo:
+	$(PYTHON) -m nexus_batch.examples.review_replies.run --count 12
 python-test:
 	$(PYTHON) -m pytest -q python/tests
 	$(PYTHON) -m ruff check python
 	$(PYTHON) -m ruff format --check python
 python-test-store:
-	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m pytest -q python/tests/test_store.py
+	PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' $(PYTHON) -m pytest -q python/tests/test_store.py python/tests/test_bulk_store.py python/tests/test_results_recovery.py
 python-test-workflows:
 	PYTHON_WORKFLOW_TESTS=1 $(PYTHON) -m pytest -q python/tests/test_workflows.py
 python-test-integration:
-	NEXUS_INTEGRATION=1 PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) $(PYTHON) -m pytest -q python/tests/test_integration.py
+	NEXUS_INTEGRATION=1 PYTHON_DATABASE_URL='$(PYTHON_DATABASE_URL)' TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) $(PYTHON) -m pytest -q python/tests/test_integration.py python/tests/test_bulk_integration.py

@@ -32,6 +32,7 @@ HARD_MAX_BATCH_REQUESTS = 50_000
 HARD_MAX_BATCH_BYTES = 200_000_000
 DEFAULT_BATCH_BYTES = 512 * 1024
 ENROLLMENT_HEARTBEAT = 30.0
+MAX_CONFIG_NAME_BYTES = 256
 
 
 @dataclass
@@ -41,6 +42,10 @@ class Request:
     run_id: str
     request_id: str
     input: str
+    # Only the bulk admission path may populate these fields. The original
+    # single-request Nexus operation retains its small text-only contract.
+    body: dict[str, Any] | None = None
+    bulk_id: str = ""
 
 
 @dataclass
@@ -78,6 +83,8 @@ class Outcome:
     batch_id: str
     result: Result | None = None
     failure: Failure | None = None
+    # Full Responses body, parsed JSON and parse diagnostics stay in PostgreSQL.
+    bulk: dict[str, Any] | None = None
 
 
 @dataclass
@@ -118,8 +125,13 @@ class Config:
     def validate(self) -> None:
         if self.mode not in {"fake", "live"}:
             raise ValueError("mode must be fake or live")
-        if not self.model or not self.nexus_endpoint:
-            raise ValueError("model and Nexus endpoint are required")
+        if any(
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value.encode("utf-8")) > MAX_CONFIG_NAME_BYTES
+            for value in (self.model, self.nexus_endpoint)
+        ):
+            raise ValueError("model and Nexus endpoint must be nonempty strings of at most 256 UTF-8 bytes")
         durations = (self.window, self.poll_interval, self.result_deadline, self.operation_timeout)
         if not all(math.isfinite(value) and value > 0 for value in durations):
             raise ValueError("durations must be finite and positive")
@@ -174,7 +186,7 @@ class Admission:
 @dataclass
 class Entry:
     request: Request
-    completion_target: CompletionTarget
+    completion_target: CompletionTarget | None
     fingerprint: str
     admitted_at: datetime
 
@@ -323,6 +335,10 @@ def _decode(cls: Any, value: Any) -> Any:
     if value is None:
         return None
     origin, args = get_origin(cls), get_args(cls)
+    if origin is not None and is_dataclass(origin):
+        # Generic reference dataclasses carry only concrete wire fields. Their
+        # type parameter is a caller-side hint and never a remote Python type.
+        cls, origin, args = origin, None, ()
     if origin in (Union, types.UnionType):
         for variant in args:
             if variant is not type(None):
@@ -371,6 +387,8 @@ def validate_request(request: Request) -> None:
             "INVALID_INPUT",
             "run_id and request_id must be 1-96 letters, digits, dots, underscores or hyphens",
         )
+    if request.body is not None or request.bulk_id:
+        raise Failure("INVALID_INPUT", "bulk request bodies require the responses operation")
     if not request.input:
         raise Failure("INVALID_INPUT", "input is required")
     if len(dumps(request).encode()) > MAX_REQUEST_BYTES:
@@ -379,7 +397,15 @@ def validate_request(request: Request) -> None:
 
 def fingerprint(request: Request) -> str:
     """Detect reuse of a logical request ID with changed request content."""
-    return hashlib.sha256(dumps(request).encode()).hexdigest()
+    # Preserve identities written by the original text-only implementation.
+    # Optional bulk fields must not change a pending legacy request's identity
+    # when a newer worker decodes it with the added dataclass defaults.
+    value = (
+        {"run_id": request.run_id, "request_id": request.request_id, "input": request.input}
+        if request.body is None and not request.bulk_id
+        else request
+    )
+    return hashlib.sha256(dumps(value).encode()).hexdigest()
 
 
 def workflow_id(batch_id: str) -> str:
@@ -398,18 +424,27 @@ def jsonl_line(request: Request, config: Config) -> bytes:
     ``store: False`` is part of the Responses request; the application still
     persists its own admitted document and normalized outcome in PostgreSQL.
     """
+    if request.bulk_id:
+        from .bulk_models import prepare_body
+
+        if request.body is None:
+            raise Failure("INVALID_INPUT", "bulk request body is missing")
+        body = prepare_body(request.body, config.model)
+        body.setdefault("max_output_tokens", config.max_output_tokens)
+    else:
+        body = {
+            "model": config.model,
+            "input": request.input,
+            "max_output_tokens": config.max_output_tokens,
+            "store": False,
+        }
     return (
         dumps(
             {
                 "custom_id": request.request_id,
                 "method": "POST",
                 "url": "/v1/responses",
-                "body": {
-                    "model": config.model,
-                    "input": request.input,
-                    "max_output_tokens": config.max_output_tokens,
-                    "store": False,
-                },
+                "body": body,
             }
         )
         + "\n"

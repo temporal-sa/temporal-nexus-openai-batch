@@ -124,7 +124,7 @@ class Store:
 
     @asynccontextmanager
     async def _connection(
-        self, operation: str, *, transaction: bool = False, readonly: bool = False
+        self, operation: str, *, transaction: bool = False, readonly: bool = False, consistent: bool = False
     ) -> AsyncIterator[asyncpg.Connection]:
         # Read-only multi-query manifest/resource reads use one stable snapshot.
         # Mutating transactions instead take explicit row locks where needed.
@@ -132,7 +132,8 @@ class Store:
             async with self.pool.acquire() as conn:
                 if transaction:
                     async with conn.transaction(
-                        isolation="repeatable_read" if readonly else "read_committed", readonly=readonly
+                        isolation="repeatable_read" if readonly or consistent else "read_committed",
+                        readonly=readonly,
                     ):
                         yield conn
                 else:
@@ -181,11 +182,13 @@ class Store:
         """
         e, target = enrollment, enrollment.completion_target
         validate_request(e.request)
+        if e.request.bulk_id:
+            raise Failure("INVALID_INPUT", "bulk requests require bulk admission")
         if e.fingerprint != fingerprint(e.request) or not valid_target(target, self.namespace):
             raise Failure("INVALID_INPUT", "enrollment fingerprint or completion target is invalid")
         async with self._connection("enroll", transaction=True) as conn:
             run = await conn.fetchrow(
-                """SELECT config,closed,stopped,admitted,sequence,open_batch_id FROM nexus_batch_runs
+                """SELECT config,closed,stopped,admitted,reserved,sequence,open_batch_id FROM nexus_batch_runs
                 WHERE namespace=$1 AND run_id=$2 FOR UPDATE""",
                 self.namespace,
                 e.request.run_id,
@@ -201,6 +204,8 @@ class Store:
                 e.request.request_id,
             )
             if previous is not None:
+                if previous["target"] is None:
+                    raise Failure("DUPLICATE_REQUEST", "request_id belongs to a bulk submission")
                 old = _decode(CompletionTarget, previous["target"], "completion target")
                 admission = Admission(batch_id=previous["batch_id"], fingerprint=e.fingerprint, config=cfg)
                 if previous["fingerprint"] == e.fingerprint and old == target:
@@ -229,105 +234,132 @@ class Store:
                         "STALE_ACTIVITY_ATTEMPT", "request is already fenced to a different Activity attempt"
                     )
                 raise Failure("DUPLICATE_REQUEST", "request_id is already owned by another operation")
-            if run["closed"] or run["stopped"]:
-                raise Failure("RUN_CLOSED", "batching run is closed to new requests")
-            if cfg.max_admissions > 0 and run["admitted"] >= cfg.max_admissions:
-                raise Failure("RUN_FULL", "batching run admission limit reached")
-            line = jsonl_line(e.request, cfg)
-            # Count the actual provider line including its JSON wrapper/newline.
-            # Document length alone would undercount escaping and field overhead.
-            if len(line) > cfg.max_batch_bytes:
-                raise Failure("INVALID_INPUT", "request exceeds configured batch byte limit")
-            now = _now()
-            deadline = e.deadline_at
-            if not isinstance(deadline, datetime) or deadline.tzinfo is None:
-                raise Failure("INVALID_INPUT", "request completion deadline must include a timezone")
-            if now >= deadline:
-                raise Failure("DEADLINE_EXCEEDED", "request completion deadline has passed")
-            batch_id, sequence = run["open_batch_id"], run["sequence"]
-            count = byte_count = 0
-            if batch_id:
-                batch = await conn.fetchrow(
-                    """SELECT requests,bytes,seal_at FROM nexus_batch_batches
-                    WHERE namespace=$1 AND batch_id=$2 AND state='open' FOR UPDATE""",
-                    self.namespace,
-                    batch_id,
-                )
-                if batch is None:
-                    raise RuntimeError("stored open batch is invalid")
-                count, byte_count = batch["requests"], batch["bytes"]
-                if byte_count + len(line) > cfg.max_batch_bytes or now >= batch["seal_at"]:
-                    # Seal before appending: never grow past the byte bound or
-                    # extend the collection window when another request arrives.
-                    await self._seal(conn, e.request.run_id, batch_id, now)
-                    sequence += 1
-                    batch_id = None
-                    count = byte_count = 0
-            if batch_id is None:
-                batch_id = f"{e.request.run_id}-{sequence:08d}"
-                await conn.execute(
-                    """INSERT INTO nexus_batch_batches(namespace,batch_id,run_id,mode,endpoint,
-                    first_admitted_at,seal_at,deadline_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)""",
-                    self.namespace,
-                    batch_id,
-                    e.request.run_id,
-                    cfg.mode,
-                    cfg.nexus_endpoint,
-                    now,
-                    now + timedelta(seconds=cfg.window),
-                    deadline,
-                )
-                await conn.execute(
-                    """UPDATE nexus_batch_runs SET open_batch_id=$3,sequence=$4
-                    WHERE namespace=$1 AND run_id=$2""",
-                    self.namespace,
-                    e.request.run_id,
-                    batch_id,
-                    sequence,
-                )
-            try:
-                await conn.execute(
-                    """INSERT INTO nexus_batch_requests(namespace,run_id,request_id,batch_id,request,target,
-                    activity_id,activity_run_id,fingerprint,admitted_at,position,deadline_at)
-                    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
-                    self.namespace,
-                    e.request.run_id,
-                    e.request.request_id,
-                    batch_id,
-                    dumps(e.request),
-                    dumps(target),
-                    target.activity_id,
-                    target.activity_run_id,
-                    e.fingerprint,
-                    now,
-                    count,
-                    deadline,
-                )
-            except asyncpg.UniqueViolationError:
-                raise Failure(
-                    "DUPLICATE_REQUEST", "completion target is already owned by another request"
-                ) from None
-            count += 1
-            byte_count += len(line)
-            # A batch can only shorten its recipient deadline as members arrive.
-            # The sealed reference must respect the earliest waiting operation.
-            await conn.execute(
-                """UPDATE nexus_batch_batches SET requests=$3,bytes=$4,deadline_at=LEAST(deadline_at,$5)
-                WHERE namespace=$1 AND batch_id=$2""",
+            return await self._admit(conn, run, e.request, target, e.deadline_at, e.fingerprint)
+
+    async def _admit(
+        self,
+        conn,
+        run,
+        request: Request,
+        target: CompletionTarget | None,
+        deadline: datetime,
+        request_fingerprint: str,
+        *,
+        bulk_id: str | None = None,
+        bulk_position: int | None = None,
+    ) -> Admission:
+        """Shared membership transition; caller holds the run row lock.
+
+        Bulk members have no completion capability. Their one recipient lives in
+        the bulk ledger, while ordinary requests retain their exact SAA target.
+        """
+        cfg = _decode(Config, run["config"], "run configuration")
+        if run["stopped"] or (run["closed"] and bulk_id is None):
+            raise Failure("RUN_CLOSED", "batching run is closed to new requests")
+        if (
+            bulk_id is None
+            and cfg.max_admissions > 0
+            and run["admitted"] + run["reserved"] >= cfg.max_admissions
+        ):
+            raise Failure("RUN_FULL", "batching run admission limit reached")
+        line = jsonl_line(request, cfg)
+        # Count the actual provider line including its JSON wrapper/newline.
+        # Document length alone would undercount escaping and field overhead.
+        if len(line) > cfg.max_batch_bytes:
+            raise Failure("INVALID_INPUT", "request exceeds configured batch byte limit")
+        now = _now()
+        if not isinstance(deadline, datetime) or deadline.tzinfo is None:
+            raise Failure("INVALID_INPUT", "request completion deadline must include a timezone")
+        if now >= deadline:
+            raise Failure("DEADLINE_EXCEEDED", "request completion deadline has passed")
+        batch_id, sequence = run["open_batch_id"], run["sequence"]
+        count = byte_count = 0
+        if batch_id:
+            batch = await conn.fetchrow(
+                """SELECT requests,bytes,seal_at FROM nexus_batch_batches
+                WHERE namespace=$1 AND batch_id=$2 AND state='open' FOR UPDATE""",
                 self.namespace,
                 batch_id,
-                count,
-                byte_count,
+            )
+            if batch is None:
+                raise RuntimeError("stored open batch is invalid")
+            count, byte_count = batch["requests"], batch["bytes"]
+            if byte_count + len(line) > cfg.max_batch_bytes or now >= batch["seal_at"]:
+                # Seal before appending: never grow past the byte bound or
+                # extend the collection window when another request arrives.
+                await self._seal(conn, request.run_id, batch_id, now)
+                sequence += 1
+                batch_id = None
+                count = byte_count = 0
+        if batch_id is None:
+            batch_id = f"{request.run_id}-{sequence:08d}"
+            await conn.execute(
+                """INSERT INTO nexus_batch_batches(namespace,batch_id,run_id,mode,endpoint,
+                first_admitted_at,seal_at,deadline_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)""",
+                self.namespace,
+                batch_id,
+                request.run_id,
+                cfg.mode,
+                cfg.nexus_endpoint,
+                now,
+                now + timedelta(seconds=cfg.window),
                 deadline,
             )
             await conn.execute(
-                "UPDATE nexus_batch_runs SET admitted=admitted+1 WHERE namespace=$1 AND run_id=$2",
+                """UPDATE nexus_batch_runs SET open_batch_id=$3,sequence=$4
+                WHERE namespace=$1 AND run_id=$2""",
                 self.namespace,
-                e.request.run_id,
+                request.run_id,
+                batch_id,
+                sequence,
             )
-            if count >= cfg.max_batch_requests or byte_count >= cfg.max_batch_bytes:
-                await self._seal(conn, e.request.run_id, batch_id, now)
-            return Admission(batch_id=batch_id, fingerprint=e.fingerprint, config=cfg)
+        try:
+            await conn.execute(
+                """INSERT INTO nexus_batch_requests(namespace,run_id,request_id,batch_id,request,target,
+                activity_id,activity_run_id,fingerprint,admitted_at,position,deadline_at,bulk_id,bulk_position)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+                self.namespace,
+                request.run_id,
+                request.request_id,
+                batch_id,
+                dumps(request),
+                dumps(target) if target else None,
+                target.activity_id if target else None,
+                target.activity_run_id if target else None,
+                request_fingerprint,
+                now,
+                count,
+                deadline,
+                bulk_id,
+                bulk_position,
+            )
+        except asyncpg.UniqueViolationError:
+            raise Failure(
+                "DUPLICATE_REQUEST", "completion target is already owned by another request"
+            ) from None
+        count += 1
+        byte_count += len(line)
+        # A batch can only shorten its recipient deadline as members arrive.
+        # The sealed reference must respect the earliest waiting operation.
+        await conn.execute(
+            """UPDATE nexus_batch_batches SET requests=$3,bytes=$4,deadline_at=LEAST(deadline_at,$5)
+            WHERE namespace=$1 AND batch_id=$2""",
+            self.namespace,
+            batch_id,
+            count,
+            byte_count,
+            deadline,
+        )
+        await conn.execute(
+            """UPDATE nexus_batch_runs SET admitted=admitted+1,
+            reserved=reserved-CASE WHEN $3 THEN 1 ELSE 0 END WHERE namespace=$1 AND run_id=$2""",
+            self.namespace,
+            request.run_id,
+            bulk_id is not None,
+        )
+        if count >= cfg.max_batch_requests or byte_count >= cfg.max_batch_bytes:
+            await self._seal(conn, request.run_id, batch_id, now)
+        return Admission(batch_id=batch_id, fingerprint=request_fingerprint, config=cfg)
 
     async def _seal(self, conn, run_id: str, batch_id: str, now: datetime) -> None:
         # Callers acquire the run row before its batch row. Sealing freezes
@@ -381,6 +413,13 @@ class Store:
                     self.namespace,
                     run_id,
                 )
+                await conn.execute(
+                    """UPDATE nexus_batch_bulk_submissions SET delivery_status='skipped',
+                    delivery_diagnostic='run explicitly stopped' WHERE namespace=$1 AND run_id=$2
+                    AND delivery_status='pending'""",
+                    self.namespace,
+                    run_id,
+                )
 
     async def run_resources(self, run_id: str) -> tuple[list[str], list[CompletionTarget]]:
         async with self._connection("run resources", transaction=True, readonly=True) as conn:
@@ -397,7 +436,8 @@ class Store:
                 run_id,
             )
             targets = await conn.fetch(
-                "SELECT target FROM nexus_batch_requests WHERE namespace=$1 AND run_id=$2 ORDER BY request_id",
+                """SELECT target FROM nexus_batch_requests WHERE namespace=$1 AND run_id=$2 AND target IS NOT NULL
+                UNION ALL SELECT target FROM nexus_batch_bulk_submissions WHERE namespace=$1 AND run_id=$2""",
                 self.namespace,
                 run_id,
             )
@@ -535,7 +575,11 @@ class Store:
             entries = [
                 Entry(
                     request=_decode(Request, entry["request"], "manifest entry"),
-                    completion_target=_decode(CompletionTarget, entry["target"], "manifest entry"),
+                    completion_target=(
+                        _decode(CompletionTarget, entry["target"], "manifest entry")
+                        if entry["target"] is not None
+                        else None
+                    ),
                     fingerprint=entry["fingerprint"],
                     admitted_at=entry["admitted_at"],
                 )
@@ -621,6 +665,18 @@ class Store:
                 status.batches.append(report)
             return status
 
+    async def outcomes_saved(self, batch_id: str) -> bool:
+        """A committed set is authoritative even when provider files disappear."""
+        async with self._connection("check stored outcomes") as conn:
+            saved = await conn.fetchval(
+                "SELECT outcomes_saved FROM nexus_batch_batches WHERE namespace=$1 AND batch_id=$2",
+                self.namespace,
+                batch_id,
+            )
+        if saved is None:
+            raise Failure("BATCH_NOT_FOUND", "batch does not exist")
+        return saved
+
     async def save_outcomes(self, batch_id: str, outcomes: list[Outcome], diagnostics: list[str]) -> None:
         """Commit the complete reconciled set exactly once before delivery begins.
 
@@ -641,12 +697,13 @@ class Store:
             if batch["outcomes_saved"]:
                 return
             rows = await conn.fetch(
-                """SELECT request_id,fingerprint FROM nexus_batch_requests
+                """SELECT request_id,fingerprint,bulk_id FROM nexus_batch_requests
                 WHERE namespace=$1 AND batch_id=$2 ORDER BY position""",
                 self.namespace,
                 batch_id,
             )
             identity = {row["request_id"]: row["fingerprint"] for row in rows}
+            bulk_ids = {row["request_id"]: row["bulk_id"] for row in rows}
             if len(identity) != len(outcomes):
                 raise Failure(
                     "INVALID_RESULT", "reconciliation must resolve every manifest request exactly once"
@@ -663,9 +720,8 @@ class Store:
                     raise Failure("INVALID_RESULT", "outcome identity or terminal result is invalid")
                 seen.add(outcome.request_id)
                 if outcome.result is not None:
-                    if (
-                        outcome.result.request_id != outcome.request_id
-                        or _bytes(dumps(outcome.result)) > MAX_RESULT_BYTES
+                    if outcome.result.request_id != outcome.request_id or (
+                        not bulk_ids[outcome.request_id] and _bytes(dumps(outcome.result)) > MAX_RESULT_BYTES
                     ):
                         raise Failure("INVALID_RESULT", "normalized result exceeds its request or size bound")
                 if outcome.failure is not None:
@@ -677,8 +733,18 @@ class Store:
                         or _bytes(failure.provider_code) > 64
                     ):
                         raise Failure("INVALID_RESULT", "failure exceeds its size bound")
+                if bulk_ids[outcome.request_id]:
+                    from .bulk_models import MAX_BULK_OUTCOME_BYTES
+
+                    if _bytes(dumps(outcome)) > MAX_BULK_OUTCOME_BYTES:
+                        raise Failure("INVALID_RESULT", "bulk outcome exceeds its external storage bound")
+                elif outcome.bulk is not None:
+                    raise Failure("INVALID_RESULT", "ordinary request cannot own a bulk outcome")
                 await conn.execute(
-                    "UPDATE nexus_batch_requests SET outcome=$4 WHERE namespace=$1 AND batch_id=$2 AND request_id=$3",
+                    """UPDATE nexus_batch_requests SET outcome=$4,outcome_saved_at=clock_timestamp(),
+                    delivery_status=CASE WHEN bulk_id IS NOT NULL AND delivery_status='pending'
+                        THEN 'stored' ELSE delivery_status END
+                    WHERE namespace=$1 AND batch_id=$2 AND request_id=$3""",
                     self.namespace,
                     batch_id,
                     outcome.request_id,
@@ -712,7 +778,7 @@ class Store:
         async with self._connection("pending deliveries") as conn:
             rows = await conn.fetch(
                 """SELECT request_id,target,outcome FROM nexus_batch_requests WHERE namespace=$1 AND batch_id=$2
-                AND delivery_status='pending' AND outcome IS NOT NULL ORDER BY position LIMIT $3""",
+                AND target IS NOT NULL AND delivery_status='pending' AND outcome IS NOT NULL ORDER BY position LIMIT $3""",
                 self.namespace,
                 batch_id,
                 _limit(limit),
@@ -818,7 +884,7 @@ class Store:
                     SELECT q.namespace,q.run_id,q.request_id FROM nexus_batch_requests q
                     JOIN nexus_batch_runs r ON r.namespace=q.namespace AND r.run_id=q.run_id
                     WHERE q.namespace=$1 AND r.mode=$2 AND r.endpoint=$3 AND NOT r.stopped
-                    AND q.delivery_status='pending' AND q.deadline_at>clock_timestamp()
+                    AND q.target IS NOT NULL AND q.delivery_status='pending' AND q.deadline_at>clock_timestamp()
                     AND q.next_heartbeat_at<=clock_timestamp()
                     ORDER BY q.next_heartbeat_at,q.run_id,q.request_id LIMIT $4 FOR UPDATE OF q SKIP LOCKED
                 ) UPDATE nexus_batch_requests q SET next_heartbeat_at=clock_timestamp()+interval '10 seconds'
@@ -843,7 +909,7 @@ class Store:
                 JOIN nexus_batch_runs r ON r.namespace=q.namespace AND r.run_id=q.run_id
                 JOIN nexus_batch_batches b ON b.namespace=q.namespace AND b.batch_id=q.batch_id
                 WHERE q.namespace=$1 AND r.mode=$2 AND r.endpoint=$3 AND NOT r.stopped
-                AND b.state='completed' AND q.delivery_status='pending' AND q.outcome IS NOT NULL
+                AND b.state='completed' AND q.target IS NOT NULL AND q.delivery_status='pending' AND q.outcome IS NOT NULL
                 ORDER BY q.admitted_at,q.batch_id,q.position LIMIT $4""",
                 self.namespace,
                 mode,
