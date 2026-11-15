@@ -47,7 +47,7 @@ from temporalio.converter import DataConverter
 
 SCHEMA = {
     "type": "object",
-    "properties": {"label": {"type": "string", "enum": ["negative", "positive"]}},
+    "properties": {"label": {"type": "string", "enum": ["alpha", "beta"]}},
     "required": ["label"],
     "additionalProperties": False,
 }
@@ -251,7 +251,7 @@ def test_bulk_schema_failures_preserve_raw_response_and_do_not_hide_other_succes
     body = prepare_body({"input": "classify"}, "fake-model", SCHEMA)
     manifest = make_manifest(body, body)
     one, two = [entry.request.request_id for entry in manifest.entries]
-    output = b"\n".join([response_line(two, '{"label": "positive"}'), response_line(one, '{"label": 7}')])
+    output = b"\n".join([response_line(two, '{"label": "beta"}'), response_line(one, '{"label": 7}')])
     outcomes, diagnostics = reconcile(manifest, Job("job", "completed"), [output])
     assert not diagnostics
     assert outcomes[0].result is not None and outcomes[0].failure is None
@@ -259,7 +259,7 @@ def test_bulk_schema_failures_preserve_raw_response_and_do_not_hide_other_succes
     assert outcomes[0].bulk["parse_error"]
     assert outcomes[0].bulk["response"]["output"][0]["content"][0]["text"] == '{"label": 7}'
     assert outcomes[1].bulk["status"] == "succeeded"
-    assert outcomes[1].bulk["output"] == {"label": "positive"}
+    assert outcomes[1].bulk["output"] == {"label": "beta"}
     assert outcomes[1].result.text == ""
 
 
@@ -310,14 +310,23 @@ def test_nonfinite_structured_output_becomes_parse_failure_not_unpersistable_dat
     dumps(outcomes[0])  # Every returned outcome must be safe for the finite store codec.
 
 
-async def test_fake_provider_supports_portable_schema_without_caller_model(tmp_path):
+async def test_fake_provider_generates_schema_fixtures_without_interpreting_input(tmp_path):
     manifest = make_manifest(
-        prepare_body({"input": "bad broken item"}, "fake-model", SCHEMA),
-        prepare_body({"input": "good item"}, "fake-model", SCHEMA),
+        prepare_body({"input": "first arbitrary input"}, "fake-model", SCHEMA),
+        prepare_body({"input": "second arbitrary input"}, "fake-model", SCHEMA),
     )
     provider = FakeProvider(tmp_path)
     file_id = await provider.upload(manifest.batch_id, jsonl(manifest))
     created = await provider.create(file_id, {})
     job = await provider.retrieve(created.id)
     outcomes, _ = reconcile(manifest, job, list(await provider.results(job)))
-    assert [item.bulk["output"]["label"] for item in outcomes] == ["negative", "positive"]
+    assert [item.bulk["output"]["label"] for item in outcomes] == ["alpha", "alpha"]
+
+
+@pytest.mark.parametrize("choices", [["alpha", "beta"], ["positive", "negative"], [2, 1]])
+def test_fake_enum_fixtures_are_independent_of_input_meaning(choices):
+    from nexus_batch.provider import _fake_structured
+
+    schema = {"enum": choices}
+    assert _fake_structured(schema, "good positive") == choices[0]
+    assert _fake_structured(schema, "bad broken negative") == choices[0]

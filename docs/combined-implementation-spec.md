@@ -117,9 +117,11 @@ that calls the bulk Nexus operation and returns a generic result reference.
 References can be passed between application stages without reading their data
 inside the workflow.
 
-Include a fake-provider two-stage example: classify a collection, select negative
-reviews in an activity, write follow-up requests, then draft replies. The example
-returns only counts and result references, with no per-item preview accumulation.
+Provide a generic inference example accepting caller-owned JSONL requests and an
+optional portable output schema. Submit every valid input without inspecting its
+meaning or selecting a subset. Return only aggregate counts and a result-set
+reference. Business filtering and chaining belong to client applications. Fake
+output generation uses deterministic schema fixtures without task-specific rules.
 
 ## Required verification
 
@@ -140,8 +142,10 @@ returns only counts and result references, with no per-item preview accumulation
    cannot complete or checkpoint it.
 9. Partial results remain inspectable after cancellation or process loss, and
    cancellation leaves other recipients' shared work intact.
-10. The two-stage example runs end to end using real Temporal and PostgreSQL with
-    a fake provider. Paid OpenAI requests are not required for verification.
+10. The generic example runs end to end using real Temporal and PostgreSQL with
+    a fake provider. Arbitrary prompts and schemas pass through without filtering;
+    raw and structured modes both return an outcome for every input. Paid OpenAI
+    requests are not required for verification.
 
 ## Operational limits
 

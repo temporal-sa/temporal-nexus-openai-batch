@@ -592,10 +592,8 @@ def _fake_structured(schema: dict[str, Any], text: str, root: dict[str, Any] | N
     if "const" in schema:
         return schema["const"]
     if "enum" in schema:
-        choices = schema["enum"]
-        negative = any(word in text.lower() for word in ("bad", "negative", "broken", "unhappy", "terrible"))
-        desired = {"negative", "neg"} if negative else {"positive", "pos"}
-        return next((value for value in choices if isinstance(value, str) and value in desired), choices[0])
+        # Deterministic schema fixture; business semantics belong to callers.
+        return schema["enum"][0]
     variants = schema.get("anyOf") or schema.get("oneOf")
     if variants:
         variant = next((item for item in variants if item.get("type") != "null"), variants[0])

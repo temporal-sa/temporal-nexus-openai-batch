@@ -109,15 +109,15 @@ from nexus_batch.bulk import BulkRequest, write_requests
 from nexus_batch.bulk_store import BulkStore
 
 
-class Sentiment(BaseModel):
-    label: str
+class InferenceOutput(BaseModel):
+    result: str
 
 
 # Inside an Activity; store is the service's namespace-scoped Store.
 requests = await write_requests(
     BulkStore(store),
     (BulkRequest(str(row.id), {"input": row.text}) for row in rows),
-    output_type=Sentiment,
+    output_type=InferenceOutput,
 )
 ```
 
@@ -135,8 +135,8 @@ from datetime import timedelta
 from nexus_batch.bulk import responses
 
 results = await responses(
-    run_id="reviews-2026-11-14",
-    submission_id="reviews-2026-11-14-classify",
+    run_id="inference-2026-11-14",
+    submission_id="inference-2026-11-14-job",
     requests=requests,
     endpoint="llm-batch-python",
     operation_timeout=timedelta(hours=26),
@@ -155,9 +155,9 @@ history:
 ```python
 from nexus_batch.bulk import iter_results
 
-async for item in iter_results(BulkStore(store), results, output_type=Sentiment):
+async for item in iter_results(BulkStore(store), results, output_type=InferenceOutput):
     if item.ok:
-        await db.upsert_sentiment(item.custom_id, item.output.label)
+        await db.save_result(item.custom_id, item.output.result)
     else:
         # item.request, item.response, item.error, and item.parse_error preserve
         # material for inspection or a deliberate repair operation.
@@ -190,19 +190,39 @@ provider work intact. Persisted partial outcomes remain available through
 `await BulkStore(store).get_result(submission_id, partial=True)` in an Activity;
 a cancelled Nexus operation does not return a normal result reference.
 
-### Two-stage example
+### Generic inference example
 
-With PostgreSQL and Temporal running, stop other Python fake workers on the same
+With PostgreSQL and Temporal running, stop other Python workers on the same
 queues and run:
 
 ```sh
-uv run --project python python -m nexus_batch.examples.review_replies.run --count 12
+make python-bulk-demo
 ```
 
-This command hosts the service and application workers, uses the persistent fake
-provider, and creates a new run automatically. It classifies the reviews, selects
-negative reviews in an Activity, and submits a second bulk manifest to draft
-replies. Its final JSON contains aggregate counts and result references; stored
-requests and replies remain in PostgreSQL. No OpenAI key is required, even when
-the repository `.env` selects live mode. Pass `--count 2000` for a larger run or
-`--run-id` to choose a new explicit identity.
+This generates 12 independent inputs and returns one result-set reference with
+aggregate counts. It hosts the service and application workers and uses fake
+OpenAI by default. Every valid input is submitted; the service has no content
+classification, filtering, or follow-up policy.
+
+Supply your own requests and optional output schema:
+
+```sh
+uv run --project python python -m nexus_batch.examples.batch_inference.run \
+  --input samples/batch_requests.jsonl --schema samples/batch_schema.json
+```
+
+Each JSONL row contains `custom_id` and `body`; `body` is an arbitrary supported
+Responses request. Prompts, instructions and output schemas belong to callers.
+Omit `--schema` for raw Responses results. Source files and schemas are loaded
+inside an Activity, and output contents stay in PostgreSQL. Consumers can use
+`iter_results` to read every result. Chaining and application-specific selection
+belong in the caller's own workflow or activities.
+
+The fake provider generates deterministic schema-shaped fixtures; it does not
+interpret the task or evaluate the input's meaning. To use real inference, pass
+`--mode live --model YOUR_MODEL` and set `OPENAI_API_KEY`. Fake mode remains the
+explicit default, including when `.env` selects live mode for the service CLI.
+
+For a long-running service, run `make python-worker PYTHON_MODE=fake` or start the CLI
+with an explicit mode and model configuration as described above. The example
+hosts temporary workers solely to demonstrate a complete client submission.

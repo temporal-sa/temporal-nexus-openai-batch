@@ -1,0 +1,3 @@
+{"custom_id":"request-1","body":{"instructions":"Answer concisely.","input":"What is a durable workflow?"}}
+{"custom_id":"request-2","body":{"instructions":"Summarize the supplied text.","input":"A batch service groups independent requests and returns an outcome for each request."}}
+{"custom_id":"request-3","body":{"instructions":"Translate the supplied text into French.","input":"The batch has completed."}}

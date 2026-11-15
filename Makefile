@@ -56,7 +56,7 @@ python-worker:
 python-demo:
 	$(PYTHON) -m nexus_batch demo $(PYTHON_MODE_FLAG) --run-id python-$$(date +%s) --input samples/documents.jsonl
 python-bulk-demo:
-	$(PYTHON) -m nexus_batch.examples.review_replies.run --count 12
+	$(PYTHON) -m nexus_batch.examples.batch_inference.run --count 12
 python-test:
 	$(PYTHON) -m pytest -q python/tests
 	$(PYTHON) -m ruff check python

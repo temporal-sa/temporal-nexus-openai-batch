@@ -332,3 +332,56 @@ async def test_bulk_cancellation_preserves_shared_work_and_external_results(rig)
             assert stored.counts.succeeded == 2
             assert len(await read(rig.store, stored)) == 2
             assert len(await provider.find({"run_id": run_id})) == 1
+
+
+@pytest.mark.parametrize("structured", [False, True])
+async def test_generic_example_submits_all_caller_inputs_without_filtering(rig, structured):
+    import json
+    import os
+
+    from nexus_batch.examples.batch_inference.run import run_example
+
+    run_id = "generic-inference-" + uuid4().hex[:12]
+    rig.runs.append(run_id)
+    requests = [
+        {"custom_id": "one", "body": {"instructions": "Translate this.", "input": "good positive"}},
+        {"custom_id": "two", "body": {"instructions": "Summarize this.", "input": "bad negative"}},
+        {"custom_id": "three", "body": {"input": [{"role": "user", "content": "arbitrary data"}]}},
+    ]
+    source = rig.directory / "caller-requests.jsonl"
+    source.write_text("\n".join(json.dumps(row) for row in requests))
+    schema = None
+    if structured:
+        schema = rig.directory / "caller-schema.json"
+        schema.write_text(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                }
+            )
+        )
+    async with asyncio.timeout(45):
+        result = await run_example(
+            address=os.getenv("TEMPORAL_ADDRESS", "127.0.0.1:7234"),
+            namespace=rig.client.namespace,
+            dsn=os.environ["PYTHON_DATABASE_URL"],
+            run_id=run_id,
+            count=12,
+            state_dir=rig.directory / "provider",
+            input_path=source,
+            schema_path=schema,
+        )
+    assert result.count == result.counts.total == result.counts.succeeded == len(requests)
+    items = await read(rig.store, result)
+    assert [item.custom_id for item in items] == [row["custom_id"] for row in requests]
+    assert [item.request for item in items] == [row["body"] for row in requests]
+    assert all(item.ok and item.response for item in items)
+    if structured:
+        assert all(isinstance(item.output["answer"], str) for item in items)
+    else:
+        assert all(item.output["object"] == "response" for item in items)
+    history = await rig.client.get_workflow_handle("batch-inference/" + run_id).fetch_history()
+    assert sum(event.HasField("nexus_operation_started_event_attributes") for event in history.events) == 1

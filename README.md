@@ -4,7 +4,7 @@ Independent Temporal Workflows call `llm-batch.respond`. Nexus starts a Standalo
 
 Go and Python implement the same single-request batching design. Python also provides a typed bulk API: one Nexus operation submits an external manifest and returns a result-set reference. Both applications use the **Responses API**. Fake mode simulates OpenAI while using real Temporal and PostgreSQL.
 
-The [combined implementation specification](docs/combined-implementation-spec.md) defines the bulk requirements and recovery rules. See [Python bulk usage](python/README.md#typed-bulk-pipelines) and the [two-stage review example](python/nexus_batch/examples/review_replies/workflow.py) for activity-side manifest production, structured results, and chaining.
+The [combined implementation specification](docs/combined-implementation-spec.md) defines the bulk requirements and recovery rules. See [Python bulk usage](python/README.md#typed-bulk-pipelines) and the [generic inference example](python/nexus_batch/examples/batch_inference/workflow.py) for activity-side manifest production, caller-supplied schemas and structured results.
 
 ## Repository
 
